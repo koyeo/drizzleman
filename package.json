@@ -1,0 +1,35 @@
+{
+  "name": "drizzlex",
+  "version": "0.1.0",
+  "description": "Transparent drizzle-kit proxy with migration hooks.",
+  "type": "module",
+  "bin": {
+    "drizzlex": "dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc && chmod +x dist/cli.js"
+  },
+  "dependencies": {
+    "jiti": "^2.4.0",
+    "picocolors": "^1.0.0"
+  },
+  "peerDependencies": {
+    "drizzle-kit": ">=0.20"
+  },
+  "optionalDependencies": {
+    "better-sqlite3": ">=11.0.0",
+    "mysql2": ">=3.0.0",
+    "pg": ">=8.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "typescript": "^5.4.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

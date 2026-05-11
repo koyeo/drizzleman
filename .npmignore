@@ -1,0 +1,8 @@
+src/
+tsconfig.json
+Makefile
+proposals/
+examples/
+.claude/
+.gitignore
+*.log
