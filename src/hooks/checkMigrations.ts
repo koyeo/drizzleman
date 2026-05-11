@@ -1,7 +1,7 @@
 import pc from 'picocolors';
 import { migrationsTableOf } from '../config.js';
 import { readApplied } from '../db/index.js';
-import { idxTagMismatches, readJournal } from '../journal.js';
+import { formatIdxIssues, hasIdxIssues, idxIssues, idxTagMismatches, readJournal } from '../journal.js';
 import type { AppliedRow, JournalEntry } from '../types.js';
 import { renderTable } from '../ui/table.js';
 import { preTarget } from './preTarget.js';
@@ -128,6 +128,16 @@ export async function runCheckMigrations(args: string[]): Promise<number> {
       `${pc.red(`zombie=${counts.zombie}`)}`,
   );
 
+  const idxState = idxIssues(journal);
+  if (hasIdxIssues(idxState)) {
+    console.log(pc.red(`Journal idx not contiguous: ${formatIdxIssues(idxState)}`));
+    console.log(
+      pc.dim(
+        `  Healthy invariant: set(idx) == {0..${journal.length - 1}}. drizzle-kit computes next idx = entries.length, so gaps/duplicates will collide on next generate.`,
+      ),
+    );
+  }
+
   const tagMismatches = idxTagMismatches(journal);
   if (tagMismatches.length > 0) {
     console.log(
@@ -169,7 +179,8 @@ export async function runCheckMigrations(args: string[]): Promise<number> {
     counts.extra === 0 &&
     counts.zombie === 0 &&
     tagMismatches.length === 0 &&
-    nonMonotonic.length === 0;
+    nonMonotonic.length === 0 &&
+    !hasIdxIssues(idxState);
   console.log(ok ? pc.green('✓ aligned') : pc.red('✗ not aligned'));
   return ok ? 0 : 1;
 }

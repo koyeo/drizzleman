@@ -3,7 +3,7 @@ import path from 'node:path';
 import pc from 'picocolors';
 import { migrationsTableOf } from '../config.js';
 import { readApplied } from '../db/index.js';
-import { idxTagMismatches, readJournal } from '../journal.js';
+import { formatIdxIssues, hasIdxIssues, idxIssues, idxTagMismatches, readJournal } from '../journal.js';
 import type { JournalEntry } from '../types.js';
 import { renderTable } from '../ui/table.js';
 import { runCheckMigrations } from './checkMigrations.js';
@@ -119,6 +119,17 @@ export async function runAlign(args: string[]): Promise<number> {
   const { apply, rest } = consumeApplyFlag(args);
   const config = await preTarget(rest);
   const journal = readJournal(config.out);
+
+  const idxState = idxIssues(journal);
+  if (hasIdxIssues(idxState)) {
+    console.log(pc.red(`[drizzleman] ✗ Journal idx not contiguous: ${formatIdxIssues(idxState)}`));
+    console.log(
+      pc.dim(
+        `  align renames files to match each entry's idx; gaps/duplicates would either leave holes or produce colliding filenames. Reconcile journal idx (so set(idx) == {0..${journal.length - 1}}) before running align.`,
+      ),
+    );
+    return 1;
+  }
 
   const mismatches = idxTagMismatches(journal);
   if (mismatches.length === 0) {

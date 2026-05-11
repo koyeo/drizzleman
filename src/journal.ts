@@ -41,6 +41,44 @@ export function idxTagMismatches(entries: JournalEntry[]): IdxTagMismatch[] {
   return out;
 }
 
+export interface JournalIdxIssues {
+  missing: number[];
+  duplicate: number[];
+  outOfRange: number[];
+}
+
+export function idxIssues(entries: JournalEntry[]): JournalIdxIssues {
+  const expected = entries.length;
+  const counts = new Map<number, number>();
+  for (const e of entries) counts.set(e.idx, (counts.get(e.idx) ?? 0) + 1);
+
+  const missing: number[] = [];
+  for (let i = 0; i < expected; i++) {
+    if (!counts.has(i)) missing.push(i);
+  }
+  const duplicate: number[] = [];
+  const outOfRange: number[] = [];
+  for (const [idx, n] of counts) {
+    if (n > 1) duplicate.push(idx);
+    if (idx < 0 || idx >= expected) outOfRange.push(idx);
+  }
+  duplicate.sort((a, b) => a - b);
+  outOfRange.sort((a, b) => a - b);
+  return { missing, duplicate, outOfRange };
+}
+
+export function hasIdxIssues(issues: JournalIdxIssues): boolean {
+  return issues.missing.length > 0 || issues.duplicate.length > 0 || issues.outOfRange.length > 0;
+}
+
+export function formatIdxIssues(issues: JournalIdxIssues): string {
+  const parts: string[] = [];
+  if (issues.missing.length > 0) parts.push(`missing=[${issues.missing.join(', ')}]`);
+  if (issues.duplicate.length > 0) parts.push(`duplicate=[${issues.duplicate.join(', ')}]`);
+  if (issues.outOfRange.length > 0) parts.push(`out-of-range=[${issues.outOfRange.join(', ')}]`);
+  return parts.join('  ');
+}
+
 export function readJournal(out: string): JournalEntry[] {
   const journalPath = journalPathOf(out);
   if (!existsSync(journalPath)) return [];

@@ -2,13 +2,24 @@ import pc from 'picocolors';
 import { migrationsTableOf } from '../config.js';
 import { readApplied } from '../db/index.js';
 import { passthrough } from '../passthrough.js';
-import { idxTagMismatches, readJournal } from '../journal.js';
+import { formatIdxIssues, hasIdxIssues, idxIssues, idxTagMismatches, readJournal } from '../journal.js';
 import { diff } from './diff.js';
 import { preTarget } from './preTarget.js';
 
 export async function runGenerate(args: string[]): Promise<number> {
   const config = await preTarget(args);
   const journal = readJournal(config.out);
+
+  const idxState = idxIssues(journal);
+  if (hasIdxIssues(idxState)) {
+    console.log(pc.red(`[drizzleman] ✗ Journal idx not contiguous: ${formatIdxIssues(idxState)}`));
+    console.log(
+      pc.dim(
+        `  drizzle-kit assigns next idx = entries.length (${journal.length}), which will collide with gaps/duplicates above. Reconcile journal so set(idx) == {0..${journal.length - 1}} before generating.`,
+      ),
+    );
+    return 1;
+  }
 
   const mismatches = idxTagMismatches(journal);
   if (mismatches.length > 0) {
