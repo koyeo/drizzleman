@@ -3,7 +3,7 @@ import path from 'node:path';
 import pc from 'picocolors';
 import { migrationsTableOf } from '../config.js';
 import { readApplied } from '../db/index.js';
-import { formatIdxIssues, hasIdxIssues, idxIssues, idxTagMismatches, readJournal } from '../journal.js';
+import { formatIdxIssues, hasIdxIssues, idxIssues, idxTagMismatches, readJournal, tagPrefixDuplicates } from '../journal.js';
 import type { JournalEntry } from '../types.js';
 import { renderTable } from '../ui/table.js';
 import { runCheckMigrations } from './checkMigrations.js';
@@ -127,6 +127,23 @@ export async function runAlign(args: string[]): Promise<number> {
     console.log(
       pc.dim(
         `  align renames files to match each entry's idx; gaps/duplicates would either leave holes or produce colliding filenames. Reconcile journal idx (so set(idx) == {0..${journal.length - 1}}) before running align.`,
+      ),
+    );
+    return 1;
+  }
+
+  const dupPrefixes = tagPrefixDuplicates(journal);
+  if (dupPrefixes.size > 0) {
+    console.log(
+      pc.red(`[drizzleman] ✗ Duplicate tag prefixes in journal (${dupPrefixes.size} prefix${dupPrefixes.size === 1 ? '' : 'es'}):`),
+    );
+    for (const [p, group] of [...dupPrefixes].sort((a, b) => a[0] - b[0])) {
+      const padded = String(p).padStart(4, '0');
+      console.log(`  - ${pc.yellow(padded)}: ${group.map((e) => `idx=${e.idx} (${e.tag})`).join(', ')}`);
+    }
+    console.log(
+      pc.dim(
+        `  align renames meta/<prefix>_snapshot.json based on each mismatched entry's current tag prefix. With duplicates, two entries claim the same source snapshot file — align would steal it from one and corrupt the other's history. Manually disambiguate (rename one entry's tag to a non-colliding prefix) before retrying.`,
       ),
     );
     return 1;

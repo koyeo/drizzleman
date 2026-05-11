@@ -71,6 +71,22 @@ export function hasIdxIssues(issues: JournalIdxIssues): boolean {
   return issues.missing.length > 0 || issues.duplicate.length > 0 || issues.outOfRange.length > 0;
 }
 
+export function tagPrefixDuplicates(entries: JournalEntry[]): Map<number, JournalEntry[]> {
+  const byPrefix = new Map<number, JournalEntry[]>();
+  for (const e of entries) {
+    const prefix = parseInt(e.tag.split('_')[0] ?? '', 10);
+    if (Number.isNaN(prefix)) continue;
+    let group = byPrefix.get(prefix);
+    if (!group) { group = []; byPrefix.set(prefix, group); }
+    group.push(e);
+  }
+  const dups = new Map<number, JournalEntry[]>();
+  for (const [p, group] of byPrefix) {
+    if (group.length > 1) dups.set(p, group);
+  }
+  return dups;
+}
+
 export function formatIdxIssues(issues: JournalIdxIssues): string {
   const parts: string[] = [];
   if (issues.missing.length > 0) parts.push(`missing=[${issues.missing.join(', ')}]`);

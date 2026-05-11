@@ -1,6 +1,9 @@
 import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import path from 'node:path';
 
+// drizzle-kit's "no parent" marker for the first snapshot. See drizzle-kit/utils.mjs `originUUID`.
+const ORIGIN_UUID = '00000000-0000-0000-0000-000000000000';
+
 export interface SnapshotInfo {
   file: string;
   filePrefix: number;
@@ -16,11 +19,14 @@ export function readSnapshots(out: string): SnapshotInfo[] {
     .map((f) => {
       const full = path.join(metaDir, f);
       const data = JSON.parse(readFileSync(full, 'utf8')) as { id?: string; prevId?: string };
+      const rawPrev = data.prevId ?? '';
+      // Normalize: drizzle-kit writes the zero UUID for "I am the genesis". Treat it as "".
+      const prevId = rawPrev === ORIGIN_UUID ? '' : rawPrev;
       return {
         file: full,
         filePrefix: parseInt(f.split('_')[0]!, 10),
         id: data.id ?? '',
-        prevId: data.prevId ?? '',
+        prevId,
       };
     })
     .sort((a, b) => a.filePrefix - b.filePrefix);
