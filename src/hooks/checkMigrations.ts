@@ -3,6 +3,7 @@ import { migrationsTableOf } from '../config.js';
 import { readApplied } from '../db/index.js';
 import { idxTagMismatches, readJournal } from '../journal.js';
 import type { AppliedRow, JournalEntry } from '../types.js';
+import { renderTable } from '../ui/table.js';
 import { preTarget } from './preTarget.js';
 
 type Status = 'applied' | 'pending' | 'drifted' | 'extra' | 'zombie';
@@ -22,10 +23,6 @@ const STATUS_COLOR: Record<Status, (s: string) => string> = {
   extra: pc.magenta,
   zombie: pc.red,
 };
-
-function stripAnsi(s: string): string {
-  return s.replace(/\x1b\[[0-9;]*m/g, '');
-}
 
 function formatWhen(ts: number | undefined): string {
   if (!ts) return '-';
@@ -73,24 +70,6 @@ function buildRows(local: JournalEntry[], applied: AppliedRow[], tLast: number):
     }
   }
   return rows;
-}
-
-function renderTable(headers: string[], rows: string[][]): string {
-  const widths = headers.map((h, i) =>
-    Math.max(stripAnsi(h).length, ...rows.map((r) => stripAnsi(r[i] ?? '').length)),
-  );
-  const pad = (cell: string, w: number) => cell + ' '.repeat(w - stripAnsi(cell).length);
-  const sep = (l: string, m: string, r: string) =>
-    l + widths.map((w) => '─'.repeat(w + 2)).join(m) + r;
-  const fmt = (cells: string[]) =>
-    '│ ' + cells.map((c, i) => pad(c, widths[i]!)).join(' │ ') + ' │';
-  return [
-    sep('┌', '┬', '┐'),
-    fmt(headers),
-    sep('├', '┼', '┤'),
-    ...rows.map(fmt),
-    sep('└', '┴', '┘'),
-  ].join('\n');
 }
 
 function findNonMonotonicWhen(local: JournalEntry[]): JournalEntry[] {

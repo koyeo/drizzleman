@@ -1,10 +1,10 @@
 {
-  "name": "drizzlex",
+  "name": "drizzleman",
   "version": "0.1.0",
   "description": "Transparent drizzle-kit proxy with migration hooks.",
   "type": "module",
   "bin": {
-    "drizzlex": "dist/cli.js"
+    "drizzleman": "dist/cli.js"
   },
   "files": [
     "dist",

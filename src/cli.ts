@@ -2,7 +2,7 @@
 import { passthrough } from './passthrough.js';
 import { runHook } from './hooks/index.js';
 
-const HOOK_COMMANDS = new Set(['generate', 'migrate', 'push', 'check-migrations']);
+const HOOK_COMMANDS = new Set(['generate', 'migrate', 'push', 'check-migrations', 'align']);
 
 async function main(): Promise<number> {
   const args = process.argv.slice(2);
@@ -19,6 +19,6 @@ main()
   .then((code) => process.exit(code))
   .catch((err: unknown) => {
     const msg = err instanceof Error ? err.message : String(err);
-    console.error(`[drizzlex] ${msg}`);
+    console.error(`[drizzleman] ${msg}`);
     process.exit(1);
   });

@@ -17,7 +17,7 @@ function formatBytes(n: number): string {
 async function confirm(): Promise<boolean> {
   if (!process.stdin.isTTY) {
     console.error(
-      pc.red(`[drizzlex] non-TTY environment; pass --yes / -y to skip the interactive confirmation.`),
+      pc.red(`[drizzleman] non-TTY environment; pass --yes / -y to skip the interactive confirmation.`),
     );
     return false;
   }
@@ -39,7 +39,7 @@ export async function runMigrate(args: string[], yes: boolean): Promise<number> 
   const d = diff(journal, applied);
 
   if (d.drifted.length > 0) {
-    console.log(pc.red(`[drizzlex] ✗ ${d.drifted.length} migration(s) drifted; refusing to migrate.`));
+    console.log(pc.red(`[drizzleman] ✗ ${d.drifted.length} migration(s) drifted; refusing to migrate.`));
     for (const x of d.drifted) console.log(`  - ${x.entry.tag} (local hash != db hash)`);
     return 1;
   }
@@ -47,17 +47,17 @@ export async function runMigrate(args: string[], yes: boolean): Promise<number> 
   if (d.dbExtra.length > 0) {
     console.log(
       pc.yellow(
-        `[drizzlex] ! DB has ${d.dbExtra.length} migration(s) not present locally — local journal is behind. drizzle-kit will only apply local pending migrations, but you should pull/sync.`,
+        `[drizzleman] ! DB has ${d.dbExtra.length} migration(s) not present locally — local journal is behind. drizzle-kit will only apply local pending migrations, but you should pull/sync.`,
       ),
     );
   }
 
   if (d.pending.length === 0) {
-    console.log(pc.green(`[drizzlex] ✓ Already up to date (db=${d.dbCount}). Skipping drizzle-kit.`));
+    console.log(pc.green(`[drizzleman] ✓ Already up to date (db=${d.dbCount}). Skipping drizzle-kit.`));
     return 0;
   }
 
-  console.log(pc.bold(`[drizzlex] Pending migrations (${d.pending.length}):`));
+  console.log(pc.bold(`[drizzleman] Pending migrations (${d.pending.length}):`));
   for (const e of d.pending) {
     let size = '?';
     try { size = formatBytes(statSync(e.sqlPath).size); } catch { /* ignore */ }
@@ -67,14 +67,14 @@ export async function runMigrate(args: string[], yes: boolean): Promise<number> 
   if (!yes) {
     const ok = await confirm();
     if (!ok) {
-      console.log(pc.dim('[drizzlex] aborted.'));
+      console.log(pc.dim('[drizzleman] aborted.'));
       return 130;
     }
   }
 
   const code = await passthrough(args);
   if (code !== 0) {
-    console.log(pc.red(`[drizzlex] drizzle-kit exited with code ${code}; skipping post-check.`));
+    console.log(pc.red(`[drizzleman] drizzle-kit exited with code ${code}; skipping post-check.`));
     return code;
   }
 
@@ -83,7 +83,7 @@ export async function runMigrate(args: string[], yes: boolean): Promise<number> 
   if (d2.drifted.length > 0 || d2.pending.length > 0) {
     console.log(
       pc.red(
-        `[drizzlex] ✗ Post-check FAILED: applied=${d2.applied.length}, pending=${d2.pending.length}, drifted=${d2.drifted.length}`,
+        `[drizzleman] ✗ Post-check FAILED: applied=${d2.applied.length}, pending=${d2.pending.length}, drifted=${d2.drifted.length}`,
       ),
     );
     for (const e of d2.pending) console.log(`  pending: ${e.tag}`);
@@ -91,7 +91,7 @@ export async function runMigrate(args: string[], yes: boolean): Promise<number> 
     return 1;
   }
   console.log(
-    pc.green(`[drizzlex] ✓ Applied ${d2.applied.length} / pending 0 / drifted 0.`),
+    pc.green(`[drizzleman] ✓ Applied ${d2.applied.length} / pending 0 / drifted 0.`),
   );
   return 0;
 }

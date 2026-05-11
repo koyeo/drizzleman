@@ -10,7 +10,7 @@ link:
 	npm link
 
 unlink:
-	npm unlink -g drizzlex || true
+	npm unlink -g drizzleman || true
 
 clean:
 	rm -rf dist node_modules

@@ -14,7 +14,7 @@ export async function runGenerate(args: string[]): Promise<number> {
   if (mismatches.length > 0) {
     console.log(
       pc.red(
-        `[drizzlex] ✗ Journal corruption: ${mismatches.length} entr${mismatches.length === 1 ? 'y' : 'ies'} where journal idx ≠ tag prefix.`,
+        `[drizzleman] ✗ Journal corruption: ${mismatches.length} entr${mismatches.length === 1 ? 'y' : 'ies'} where journal idx ≠ tag prefix.`,
       ),
     );
     for (const m of mismatches) {
@@ -34,7 +34,7 @@ export async function runGenerate(args: string[]): Promise<number> {
   const d = diff(journal, applied);
 
   if (d.drifted.length > 0) {
-    console.log(pc.red(`[drizzlex] ✗ ${d.drifted.length} migration(s) drifted; refusing to generate.`));
+    console.log(pc.red(`[drizzleman] ✗ ${d.drifted.length} migration(s) drifted; refusing to generate.`));
     for (const x of d.drifted) {
       console.log(`  - ${x.entry.tag} (local hash != db hash)`);
     }
@@ -44,7 +44,7 @@ export async function runGenerate(args: string[]): Promise<number> {
   if (d.localCount > d.dbCount) {
     console.log(
       pc.red(
-        `[drizzlex] ✗ Local journal ahead of DB by ${d.localCount - d.dbCount} migration(s). Run 'drizzlex migrate' first, then generate.`,
+        `[drizzleman] ✗ Local journal ahead of DB by ${d.localCount - d.dbCount} migration(s). Run 'drizzleman migrate' first, then generate.`,
       ),
     );
     for (const e of d.pending) console.log(`  - ${e.tag}`);
@@ -54,14 +54,14 @@ export async function runGenerate(args: string[]): Promise<number> {
   if (d.localCount < d.dbCount) {
     console.log(
       pc.red(
-        `[drizzlex] ✗ DB has ${d.dbCount - d.localCount} migration(s) not present locally (db=${d.dbCount}, local=${d.localCount}). Pull/sync the missing migration files first.`,
+        `[drizzleman] ✗ DB has ${d.dbCount - d.localCount} migration(s) not present locally (db=${d.dbCount}, local=${d.localCount}). Pull/sync the missing migration files first.`,
       ),
     );
     return 1;
   }
 
   console.log(
-    pc.dim(`[drizzlex] Aligned: local=${d.localCount} / db=${d.dbCount}. Next migration index = ${d.localCount}.`),
+    pc.dim(`[drizzleman] Aligned: local=${d.localCount} / db=${d.dbCount}. Next migration index = ${d.localCount}.`),
   );
   return passthrough(args);
 }

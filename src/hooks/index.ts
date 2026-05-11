@@ -1,3 +1,4 @@
+import { runAlign } from './align.js';
 import { runCheckMigrations } from './checkMigrations.js';
 import { runGenerate } from './generate.js';
 import { runMigrate } from './migrate.js';
@@ -28,6 +29,8 @@ export async function runHook(cmd: string, args: string[]): Promise<number> {
       return runPush(args);
     case 'check-migrations':
       return runCheckMigrations(args);
+    case 'align':
+      return runAlign(args);
     default:
       throw new Error(`unknown hook command: ${cmd}`);
   }

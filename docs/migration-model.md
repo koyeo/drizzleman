@@ -2,7 +2,7 @@
 
 > 这套模型横跨三个"地盘": 磁盘文件、`_journal.json`、DB 表 `__drizzle_migrations`。
 > drizzle-kit 维护 journal 与文件, drizzle-orm 凭 journal 决定应用什么进 DB。
-> drizzlex 在两者外面读这三者状态做检测。
+> drizzleman 在两者外面读这三者状态做检测。
 
 ---
 
@@ -24,7 +24,7 @@
 | DB `__drizzle_migrations.hash` | 写入时存 journal entry 的 hash; 应用流程**不读**, 仅供工具做 drift 校验 |
 | DB `__drizzle_migrations.created_at` | 应用时写入的 `journal.when` 原值; **决定下次哪些 entry 会被跑**的唯一依据 |
 | `T_last` = `MAX(created_at)` | drizzle-orm 每次 migrate **拉一次**这个值, 作为"过滤已应用 entry"的**阈值** |
-| `drizzlex` 内的 hash 比对 | drift 检测**专用**, 与 drizzle-orm 的应用逻辑**完全无关**, 仅用于报警 |
+| `drizzleman` 内的 hash 比对 | drift 检测**专用**, 与 drizzle-orm 的应用逻辑**完全无关**, 仅用于报警 |
 
 **主轴一句**: drizzle-orm 应用迁移**只看 `journal.entries[].when` 是否 > DB `T_last`**, 其余字段要么给 drizzle-kit 用 (`idx`), 要么给人 / 工具看的存档 (`tag` 前缀, `hash`, `id`)。
 
@@ -42,7 +42,7 @@
                │                          int(prefix)                            │
                │                              │                                 │
                └─── 等同 ────── entry.hash    │                  写入瞬间 ───>  hash
-                               (drizzlex 算)  │                                 │
+                               (drizzleman 算)  │                                 │
                                               idx 字段           drizzle-orm 不读
                                                 │
            meta/<NNNN>_snapshot.json ───前缀───┘
@@ -57,7 +57,7 @@
 | 3 | `entry.idx` ↔ `entry.tag` 前缀 | `int(tag.split('_')[0]) == idx` | drizzle-kit 生成时算, 后续可能脱钩 |
 | 4 | `entry.idx` ↔ `entries[]` 数组下标 | `arr[i].idx == i` | drizzle-kit 内部维护 |
 | 5 | `entry.when` ↔ DB `created_at` | 已应用 entry: 逐字相等 | drizzle-orm 应用时写入 |
-| 6 | drizzlex 算的 `entry.hash` ↔ DB `hash` | 已应用且未改文件: 相等 | 应用瞬间相等, 改文件即漂移 |
+| 6 | drizzleman 算的 `entry.hash` ↔ DB `hash` | 已应用且未改文件: 相等 | 应用瞬间相等, 改文件即漂移 |
 | 7 | `entries[].when` 序 ↔ `idx` 序 | when 随 idx 单调递增 | drizzle-kit 用 `Date.now()` 自然产生 |
 | 8 | `entries[].length` ↔ DB 行数 | 对齐时相等 | 取决于已 migrate 到哪 |
 | 9 | `<out>/*.sql` (磁盘) ↔ `entries[].tag` | 磁盘文件 ⊆ journal tags | drizzle-kit 维护 |
@@ -155,9 +155,9 @@ for each mismatched entry:
 
 ## 6. 工具映射
 
-drizzlex 各命令分别用了哪些对应关系:
+drizzleman 各命令分别用了哪些对应关系:
 
-| drizzlex 命令 | 用到的对应 | 干什么 |
+| drizzleman 命令 | 用到的对应 | 干什么 |
 |---|---|---|
 | `generate` 前置检查 | (3) → idx≠前缀阻塞; (8)+(6) → 对齐校验 | 决定是否放行透传 |
 | `migrate` 前置 | (8)+(6) → pending 清单 + drift 阻塞 | 列 pending 让用户确认 |
@@ -185,6 +185,6 @@ drizzlex 各命令分别用了哪些对应关系:
                 │       INSERT (hash=sha256(file), created_at=entry.when)
                 └─ 注意: 全程不读 entry.idx, 不读 DB.id, 不读 DB.hash
 
-drizzlex 检测:  上述任何对应关系出问题都能发现 (§3)
+drizzleman 检测:  上述任何对应关系出问题都能发现 (§3)
                  自身不应用、不生成, 仅读三个地盘做交叉验证
 ```
