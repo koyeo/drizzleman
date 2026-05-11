@@ -1,4 +1,4 @@
-import { copyFileSync, existsSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { copyFileSync, existsSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import pc from 'picocolors';
 import { migrationsTableOf } from '../config.js';
@@ -69,7 +69,7 @@ function tempSnap(dir: string, idx: number): string {
   return path.join(dir, `__drizzleman_align__${String(idx).padStart(4, '0')}_snapshot.json`);
 }
 
-function applyPlans(out: string, plans: AlignPlan[]): void {
+function applyPlans(out: string, plans: AlignPlan[]): string {
   const outDir = path.resolve(process.cwd(), out);
   const metaDir = path.join(outDir, 'meta');
   const journalPath = path.join(metaDir, '_journal.json');
@@ -113,6 +113,7 @@ function applyPlans(out: string, plans: AlignPlan[]): void {
     if (t !== undefined) e.tag = t;
   }
   writeFileSync(journalPath, JSON.stringify(rawJournal, null, 2));
+  return bakPath;
 }
 
 export async function runAlign(args: string[]): Promise<number> {
@@ -170,8 +171,9 @@ export async function runAlign(args: string[]): Promise<number> {
   }
 
   console.log(pc.bold('[drizzleman] Applying...'));
+  let bakPath: string;
   try {
-    applyPlans(config.out, plans);
+    bakPath = applyPlans(config.out, plans);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     console.log(pc.red(`[drizzleman] ✗ align failed mid-flight: ${msg}`));
@@ -184,9 +186,11 @@ export async function runAlign(args: string[]): Promise<number> {
   const code = await runCheckMigrations(rest);
   if (code !== 0) {
     console.log(
-      pc.red(`[drizzleman] ✗ post-align check failed; see output above. Backup at ${path.join(config.out, 'meta/_journal.json.bak.<ts>')}.`),
+      pc.red(`[drizzleman] ✗ post-align check failed; see output above. Backup retained at ${bakPath}.`),
     );
     return code;
   }
+  unlinkSync(bakPath);
+  console.log(pc.dim(`  removed backup: ${bakPath}`));
   return 0;
 }
