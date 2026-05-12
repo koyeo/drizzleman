@@ -155,6 +155,49 @@ function cleanupDir(dir: string): void {
   if (existsSync(dir)) rmSync(dir, { recursive: true, force: true });
 }
 
+// drizzle-kit 0.31.x generate emits statements in the order tables → FK ALTERs →
+// indexes. That breaks any FK whose target column is unique only via a uniqueIndex
+// (not via a column-level `.unique()` constraint): postgres rejects the FK at
+// apply time with "no unique constraint matching given keys" (SQLSTATE 42830).
+// Re-bucket the statements so all CREATE INDEX statements come before the FK
+// ALTERs while preserving relative order within each bucket.
+function reorderForFkSafety(sql: string): string {
+  const SEP = '--> statement-breakpoint';
+  const parts = sql.split(SEP);
+  type Bucket = 'pre' | 'type' | 'table' | 'index' | 'fk' | 'other';
+  const buckets: Record<Bucket, string[]> = {
+    pre: [],
+    type: [],
+    table: [],
+    index: [],
+    fk: [],
+    other: [],
+  };
+  for (const raw of parts) {
+    const trimmed = raw.trim();
+    if (trimmed.length === 0) {
+      buckets.pre.push(raw);
+      continue;
+    }
+    if (/^\s*CREATE\s+TYPE\s/i.test(trimmed)) buckets.type.push(raw);
+    else if (/^\s*CREATE\s+(?:UNLOGGED\s+|TEMP\s+|TEMPORARY\s+)?TABLE\s/i.test(trimmed))
+      buckets.table.push(raw);
+    else if (/^\s*CREATE\s+(?:UNIQUE\s+)?INDEX\s/i.test(trimmed)) buckets.index.push(raw);
+    else if (/^\s*ALTER\s+TABLE\s+.+?\s+ADD\s+CONSTRAINT\s+"[^"]+"\s+FOREIGN\s+KEY/is.test(trimmed))
+      buckets.fk.push(raw);
+    else buckets.other.push(raw);
+  }
+  const ordered = [
+    ...buckets.pre,
+    ...buckets.type,
+    ...buckets.table,
+    ...buckets.index,
+    ...buckets.fk,
+    ...buckets.other,
+  ];
+  return ordered.join(SEP);
+}
+
 // ---- snapshot diff ----
 
 interface SnapshotJson {
@@ -204,29 +247,108 @@ function tableName(t: SnapshotTable, key: string): string {
   return dot >= 0 ? key.slice(dot + 1) : key;
 }
 
-function tableEntities(t: SnapshotTable, key: string): {
+// FK / index are compared by structural SIGNATURE (not by name).
+// Reason: drizzle-kit push generates constraint / index names with a drizzle-specific
+// convention (e.g. `<table>_<col>_<reftable>_<refcol>_fk`), while a target DB populated
+// by hand-written migrations typically uses postgres defaults (`<table>_<col>_fkey`,
+// `<table>_<col>_idx`). Naive name-keyed diff inflates schema.sql with these renames.
+// Signature-keyed diff treats two FKs/indexes as equivalent iff they reference the
+// same columns with the same semantics, regardless of name.
+
+interface SnapshotFk {
+  name?: string;
+  tableFrom?: string;
+  tableTo?: string;
+  schemaTo?: string;
+  columnsFrom?: string[];
+  columnsTo?: string[];
+  onDelete?: string;
+  onUpdate?: string;
+}
+
+interface SnapshotIdxCol {
+  expression?: string;
+  isExpression?: boolean;
+  asc?: boolean;
+  nulls?: string;
+}
+
+interface SnapshotIdx {
+  name?: string;
+  columns?: Array<SnapshotIdxCol | string>;
+  isUnique?: boolean;
+  method?: string;
+  where?: string;
+}
+
+function normalizeOnAction(v: unknown): string {
+  const s = String(v ?? '').toLowerCase().trim();
+  return s.length > 0 ? s : 'no action';
+}
+
+function fkSignature(fk: SnapshotFk, fromSchema: string): string {
+  const tableFrom = String(fk.tableFrom ?? '');
+  const tableTo = String(fk.tableTo ?? '');
+  const schemaTo = (() => {
+    const s = String(fk.schemaTo ?? '');
+    return s.length > 0 ? s : (fromSchema || 'public');
+  })();
+  const cFrom = Array.isArray(fk.columnsFrom) ? fk.columnsFrom.map(String).join(',') : '';
+  const cTo = Array.isArray(fk.columnsTo) ? fk.columnsTo.map(String).join(',') : '';
+  const onDelete = normalizeOnAction(fk.onDelete);
+  const onUpdate = normalizeOnAction(fk.onUpdate);
+  return `${tableFrom}(${cFrom})->${schemaTo}.${tableTo}(${cTo})|del=${onDelete}|upd=${onUpdate}`;
+}
+
+function indexSignature(idx: SnapshotIdx, schema: string, table: string): string {
+  const cols = Array.isArray(idx.columns) ? idx.columns : [];
+  const colSigs = cols.map((c) => {
+    if (typeof c === 'string') return c;
+    const expr = String(c.expression ?? '');
+    const isExpr = Boolean(c.isExpression);
+    const asc = c.asc === false ? 'desc' : 'asc';
+    // Postgres default null ordering: ASC=last, DESC=first. Normalize so two indexes
+    // that differ only by an explicit-vs-default null clause still compare equal.
+    const nulls = String(c.nulls ?? (asc === 'asc' ? 'last' : 'first')).toLowerCase();
+    return `${isExpr ? `(${expr})` : expr}@${asc}/${nulls}`;
+  }).join(',');
+  const unique = Boolean(idx.isUnique);
+  const method = String(idx.method ?? 'btree').toLowerCase();
+  const where = String(idx.where ?? '').replace(/\s+/g, ' ').trim();
+  return `${schema}.${table}[${colSigs}]|unique=${unique}|method=${method}|where=${where}`;
+}
+
+interface TableEntities {
   tableKey: string;
-  columns: Map<string, string>; // colName → column:<schema>.<table>.<col>
-  indexes: Map<string, string>;
-  fks: Map<string, string>;
-} {
+  columnKeys: Map<string, string>;   // colName → column:<schema>.<table>.<col>
+  fkSigs: Map<string, string>;       // structural signature → fk:<schema>.<table>.<name>
+  indexSigs: Map<string, string>;    // structural signature → index:<schema>.<name>
+}
+
+function tableEntities(t: SnapshotTable, key: string): TableEntities {
   const schema = tableSchema(t, key);
   const name = tableName(t, key);
   const qualified = `${schema}.${name}`;
   const tableKey = `table:${qualified}`;
-  const columns = new Map<string, string>();
+
+  const columnKeys = new Map<string, string>();
   for (const c of Object.keys(t.columns ?? {})) {
-    columns.set(c, `column:${qualified}.${c}`);
+    columnKeys.set(c, `column:${qualified}.${c}`);
   }
-  const indexes = new Map<string, string>();
-  for (const idxName of Object.keys(t.indexes ?? {})) {
-    indexes.set(idxName, `index:${schema}.${idxName}`);
+
+  const fkSigs = new Map<string, string>();
+  for (const [fkName, fk] of Object.entries(t.foreignKeys ?? {})) {
+    const sig = fkSignature(fk as SnapshotFk, schema);
+    fkSigs.set(sig, `fk:${qualified}.${fkName}`);
   }
-  const fks = new Map<string, string>();
-  for (const fkName of Object.keys(t.foreignKeys ?? {})) {
-    fks.set(fkName, `fk:${qualified}.${fkName}`);
+
+  const indexSigs = new Map<string, string>();
+  for (const [idxName, idx] of Object.entries(t.indexes ?? {})) {
+    const sig = indexSignature(idx as SnapshotIdx, schema, name);
+    indexSigs.set(sig, `index:${schema}.${idxName}`);
   }
-  return { tableKey, columns, indexes, fks };
+
+  return { tableKey, columnKeys, fkSigs, indexSigs };
 }
 
 function diffSnapshots(target: SnapshotJson, schemaDb: SnapshotJson): SnapshotDiff {
@@ -236,39 +358,38 @@ function diffSnapshots(target: SnapshotJson, schemaDb: SnapshotJson): SnapshotDi
   const tT = target.tables ?? {};
   const tS = schemaDb.tables ?? {};
 
-  // Tables (and contained columns/indexes/fks)
+  // Tables (by qualified key); columns by name; fks/indexes by structural signature.
   for (const [key, def] of Object.entries(tT)) {
     const ents = tableEntities(def, key);
     if (!(key in tS)) {
       onlyInTarget.tables.push(ents.tableKey);
-      for (const v of ents.columns.values()) onlyInTarget.columns.push(v);
-      for (const v of ents.indexes.values()) onlyInTarget.indexes.push(v);
-      for (const v of ents.fks.values()) onlyInTarget.foreignKeys.push(v);
+      for (const v of ents.columnKeys.values()) onlyInTarget.columns.push(v);
+      for (const v of ents.indexSigs.values()) onlyInTarget.indexes.push(v);
+      for (const v of ents.fkSigs.values()) onlyInTarget.foreignKeys.push(v);
     } else {
-      const sDef = tS[key]!;
-      const sEnts = tableEntities(sDef, key);
-      for (const [c, k] of ents.columns) if (!sEnts.columns.has(c)) onlyInTarget.columns.push(k);
-      for (const [i, k] of ents.indexes) if (!sEnts.indexes.has(i)) onlyInTarget.indexes.push(k);
-      for (const [f, k] of ents.fks) if (!sEnts.fks.has(f)) onlyInTarget.foreignKeys.push(k);
+      const sEnts = tableEntities(tS[key]!, key);
+      for (const [c, k] of ents.columnKeys) if (!sEnts.columnKeys.has(c)) onlyInTarget.columns.push(k);
+      for (const [sig, k] of ents.indexSigs) if (!sEnts.indexSigs.has(sig)) onlyInTarget.indexes.push(k);
+      for (const [sig, k] of ents.fkSigs) if (!sEnts.fkSigs.has(sig)) onlyInTarget.foreignKeys.push(k);
     }
   }
   for (const [key, def] of Object.entries(tS)) {
     const ents = tableEntities(def, key);
     if (!(key in tT)) {
       onlyInSchemaDb.tables.push(ents.tableKey);
-      for (const v of ents.columns.values()) onlyInSchemaDb.columns.push(v);
-      for (const v of ents.indexes.values()) onlyInSchemaDb.indexes.push(v);
-      for (const v of ents.fks.values()) onlyInSchemaDb.foreignKeys.push(v);
+      for (const v of ents.columnKeys.values()) onlyInSchemaDb.columns.push(v);
+      for (const v of ents.indexSigs.values()) onlyInSchemaDb.indexes.push(v);
+      for (const v of ents.fkSigs.values()) onlyInSchemaDb.foreignKeys.push(v);
     } else {
-      const tDef = tT[key]!;
-      const tEnts = tableEntities(tDef, key);
-      for (const [c, k] of ents.columns) if (!tEnts.columns.has(c)) onlyInSchemaDb.columns.push(k);
-      for (const [i, k] of ents.indexes) if (!tEnts.indexes.has(i)) onlyInSchemaDb.indexes.push(k);
-      for (const [f, k] of ents.fks) if (!tEnts.fks.has(f)) onlyInSchemaDb.foreignKeys.push(k);
+      const tEnts = tableEntities(tT[key]!, key);
+      for (const [c, k] of ents.columnKeys) if (!tEnts.columnKeys.has(c)) onlyInSchemaDb.columns.push(k);
+      for (const [sig, k] of ents.indexSigs) if (!tEnts.indexSigs.has(sig)) onlyInSchemaDb.indexes.push(k);
+      for (const [sig, k] of ents.fkSigs) if (!tEnts.fkSigs.has(sig)) onlyInSchemaDb.foreignKeys.push(k);
     }
   }
 
-  // Enums — snapshot keys are like "public.scan_status"
+  // Enums — keyed by qualified name. Value-list mismatches (same name, different
+  // members) are not currently diffed; future work.
   const eT = new Set(Object.keys(target.enums ?? {}));
   const eS = new Set(Object.keys(schemaDb.enums ?? {}));
   for (const k of eT) if (!eS.has(k)) onlyInTarget.enums.push(`enum:${k}`);
@@ -589,18 +710,74 @@ export async function runBaseline(args: string[]): Promise<number> {
     return 1;
   }
 
-  // ---- Step C: push local schema to schema DB ----
-  console.log(pc.bold(`\n[drizzleman] Step C: drizzle-kit push → schema DB`));
-  const pushArgs = [
-    'push',
+  // ---- Step C: materialize local schema to schema DB via generate + migrate ----
+  // We deliberately avoid `drizzle-kit push` — in 0.31.5 it silently drops indexes
+  // declared in pgTable's second-arg callback (and some FKs), yielding a fake schema
+  // DB snapshot that under-reports local schema. `generate` produces canonical SQL
+  // covering everything; `migrate` then applies it via drizzle-kit's own runner.
+  console.log(pc.bold(`\n[drizzleman] Step C: drizzle-kit generate → migrate (schema DB)`));
+  const tmpgenDir = path.join('/tmp', `drizzleman-baseline-tmpgen-${ts}`);
+  if (existsSync(tmpgenDir)) {
+    console.log(pc.red(`[drizzleman] ✗ tmpgen dir already exists: ${tmpgenDir}; remove it and retry.`));
+    cleanupDir(previewDir);
+    return 1;
+  }
+  mkdirSync(tmpgenDir, { recursive: true });
+  console.log(pc.dim(`  tmpgen: ${tmpgenDir}`));
+
+  const genTmpArgs = [
+    'generate',
     `--dialect=${config.dialect}`,
     ...buildSchemaArgs(config.schema),
-    `--url=${schemaDbUrl}`,
-    '--force',
+    `--out=${tmpgenDir}`,
+    '--name=schema',
   ];
-  code = await passthrough(pushArgs);
+  code = await passthrough(genTmpArgs);
   if (code !== 0) {
-    console.log(pc.red(`[drizzleman] ✗ push exited ${code}; schema DB may be partially populated. Drop it and retry.`));
+    console.log(pc.red(`[drizzleman] ✗ generate (to tmpgen) exited ${code}.`));
+    cleanupDir(previewDir);
+    return code;
+  }
+
+  // Reorder the generated SQL: drizzle-kit emits FK constraints BEFORE unique
+  // indexes that the FKs depend on (any FK referencing a uniqueIndex-backed
+  // unique constraint fails with "no unique constraint matching given keys" /
+  // pg error 42830). Bucket statements into:
+  //   CREATE TYPE  →  CREATE TABLE  →  CREATE [UNIQUE] INDEX  →  ALTER … FK  →  other
+  const generatedSqlPath = path.join(tmpgenDir, '0000_schema.sql');
+  if (existsSync(generatedSqlPath)) {
+    const original = readFileSync(generatedSqlPath, 'utf8');
+    const reordered = reorderForFkSafety(original);
+    if (reordered !== original) {
+      writeFileSync(generatedSqlPath, reordered);
+      console.log(pc.dim('  reordered generated SQL (CREATE INDEX before ALTER ADD FK)'));
+    }
+  }
+
+  // drizzle-kit migrate only accepts --config (no other flags), so write a tiny
+  // JSON config pointing at tmpgen + schema DB url, then invoke.
+  const tmpConfigPath = path.join(tmpgenDir, 'drizzle.config.json');
+  writeFileSync(
+    tmpConfigPath,
+    JSON.stringify(
+      {
+        dialect: config.dialect,
+        out: tmpgenDir,
+        dbCredentials: { url: schemaDbUrl },
+      },
+      null,
+      2,
+    ),
+  );
+
+  const migrateArgs = ['migrate', `--config=${tmpConfigPath}`];
+  code = await passthrough(migrateArgs);
+  if (code !== 0) {
+    console.log(
+      pc.red(
+        `[drizzleman] ✗ migrate (to schema DB) exited ${code}; schema DB may be partially populated. Drop it and retry. tmpgen kept at ${tmpgenDir} for inspection.`,
+      ),
+    );
     cleanupDir(previewDir);
     return code;
   }

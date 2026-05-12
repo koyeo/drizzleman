@@ -4,6 +4,15 @@
 
 ---
 
+## [patch-001] 用户本地 schema 用了 deprecated 对象式第三参,drizzle-kit 静默忽略
+
+- **类型**:用户侧修复 / 本仓库可加 sanity-warn
+- **位置**:`/Users/zeiss/certik/SkAI/packages/db/src/schema/*.ts` 全部 47 处 `(table) => ({...})`
+- **描述**:drizzle-orm 0.30+ 把 `pgTable(name, cols, (table) => ({...}))` 对象式第三参标 deprecated;drizzle-kit 0.31.5 完全忽略对象式声明的 index / FK / 复合 PK / check。结果是本地 schema 看起来有声明,但 `drizzle-kit push` 后 schema DB 里那些 index/FK 一个都没创建。baseline 跑出来的 `schema.sql` 里 126 个 idx + 24 个 fk 都是这个被忽略的范围。
+- **建议**:
+  - **用户侧**:把对象式改成数组式 — `(table) => [...]`,value 直接拍平、抛掉 key。改完重跑 `drizzleman baseline` 应能看到 `schema.sql` 蒸发到接近空。
+  - **drizzleman 侧(可选 follow-up)**:在 Step E snapshot diff 后加个 sanity-check —— 若 schema DB introspect 出来的 `indexes` 总数远小于 target(比如 < 50% 且 target 又有 > 20 个),红字 warn 用户「请检查 pgTable 第三参是否使用了 deprecated 对象式语法」。
+
 ## [plans/001-baseline-snapshot-diff.md] 缺列(in-both-table)的 `ALTER TABLE ADD COLUMN` 合成未实现
 
 - **类型**:范围外发现 / 后续完善
