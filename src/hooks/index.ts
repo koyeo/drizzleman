@@ -1,4 +1,5 @@
 import { runAlign } from './align.js';
+import { runBaseline } from './baseline.js';
 import { runCheckChain } from './checkChain.js';
 import { runCheckMigrations } from './checkMigrations.js';
 import { runGenerate } from './generate.js';
@@ -37,6 +38,8 @@ export async function runHook(cmd: string, args: string[]): Promise<number> {
       return runAlign(args);
     case 'renumber':
       return runRenumber(args);
+    case 'baseline':
+      return runBaseline(args);
     default:
       throw new Error(`unknown hook command: ${cmd}`);
   }

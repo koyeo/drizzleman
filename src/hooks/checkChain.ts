@@ -3,6 +3,7 @@ import pc from 'picocolors';
 import { readJournal, tagPrefixDuplicates } from '../journal.js';
 import { readSnapshots, walkChain } from '../snapshot.js';
 import type { JournalEntry } from '../types.js';
+import { renderTable } from '../ui/table.js';
 import { preTarget } from './preTarget.js';
 
 export async function runCheckChain(args: string[]): Promise<number> {
@@ -54,13 +55,53 @@ export async function runCheckChain(args: string[]): Promise<number> {
     }
   }
 
-  // Journal ↔ snapshot mapping
-  const entryPrefixes = new Set<number>();
+  // Journal entries grouped by tag prefix (used for both the mapping table and the issue lists).
+  const entriesByPrefix = new Map<number, JournalEntry[]>();
   for (const e of journal) {
     const prefix = parseInt(e.tag.split('_')[0] ?? '', 10);
-    if (!Number.isNaN(prefix)) entryPrefixes.add(prefix);
+    if (Number.isNaN(prefix)) continue;
+    let group = entriesByPrefix.get(prefix);
+    if (!group) { group = []; entriesByPrefix.set(prefix, group); }
+    group.push(e);
   }
+  const entryPrefixes = new Set(entriesByPrefix.keys());
   const snapshotPrefixes = new Set(snapshots.map((s) => s.filePrefix));
+
+  // Snapshot ↔ sql correspondence table (one row per snapshot, in chain order then orphans).
+  console.log();
+  console.log(pc.bold('Snapshot ↔ sql correspondence:'));
+  const reachableInOrder = chain.order;
+  const orphansSorted = snapshots
+    .filter((s) => !reachableFiles.has(s.file))
+    .sort((a, b) => a.filePrefix - b.filePrefix);
+  const fmtId = (id: string) => (id === '' ? pc.dim('(genesis)') : id.slice(0, 8));
+  const fmtMatched = (prefix: number): string => {
+    const matched = entriesByPrefix.get(prefix) ?? [];
+    if (matched.length === 0) return pc.red('(no journal entry)');
+    return matched
+      .map((e) => `${pc.dim(`idx=${String(e.idx).padStart(3)}`)} ${e.tag}.sql`)
+      .join('  +  ');
+  };
+  const rows: string[][] = [];
+  reachableInOrder.forEach((s, i) => {
+    rows.push([
+      String(i),
+      path.basename(s.file),
+      fmtId(s.id),
+      fmtId(s.prevId),
+      fmtMatched(s.filePrefix),
+    ]);
+  });
+  for (const s of orphansSorted) {
+    rows.push([
+      pc.red('orph'),
+      path.basename(s.file),
+      fmtId(s.id),
+      fmtId(s.prevId),
+      fmtMatched(s.filePrefix),
+    ]);
+  }
+  console.log(renderTable(['#', 'snapshot', 'id', 'prevId', 'sql (journal entries)'], rows));
 
   const dupPrefixes = [...tagPrefixDuplicates(journal)].sort((a, b) => a[0] - b[0]);
 

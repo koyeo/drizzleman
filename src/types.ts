@@ -14,6 +14,7 @@ export interface DbCredentials {
 export interface DrizzleConfig {
   dialect: Dialect;
   out: string;
+  schema?: string | string[];
   dbCredentials: DbCredentials;
   migrations?: {
     table?: string;

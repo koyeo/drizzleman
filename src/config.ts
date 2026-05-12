@@ -68,9 +68,10 @@ function normalize(raw: Record<string, unknown>, configPath: string): DrizzleCon
     throw new Error(`drizzle config at ${configPath} is missing required field 'dialect'`);
   }
   const out = (raw.out as string | undefined) ?? 'drizzle';
+  const schema = raw.schema as DrizzleConfig['schema'] | undefined;
   const dbCredentials = (raw.dbCredentials as DrizzleConfig['dbCredentials']) ?? {};
   const migrations = raw.migrations as DrizzleConfig['migrations'] | undefined;
-  return { dialect, out, dbCredentials, migrations };
+  return { dialect, out, schema, dbCredentials, migrations };
 }
 
 export function migrationsTableOf(config: DrizzleConfig): { schema?: string; table: string } {

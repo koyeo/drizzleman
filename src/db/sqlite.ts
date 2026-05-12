@@ -6,27 +6,38 @@ function quoteIdent(name: string): string {
   return `"${name.replace(/"/g, '""')}"`;
 }
 
+interface SqliteStatement {
+  all: (...params: unknown[]) => unknown[];
+  get: (...params: unknown[]) => unknown;
+  run: (...params: unknown[]) => unknown;
+}
+
 interface SqliteDatabase {
-  prepare: (sql: string) => {
-    all: (...params: unknown[]) => unknown[];
-    get: (...params: unknown[]) => unknown;
-  };
+  prepare: (sql: string) => SqliteStatement;
+  exec: (sql: string) => unknown;
+  transaction: <T>(fn: () => T) => () => T;
   close: () => void;
 }
 
 type SqliteCtor = new (file: string, opts?: Record<string, unknown>) => SqliteDatabase;
 
+async function loadCtor(): Promise<SqliteCtor> {
+  const mod = await safeImport<{ default: SqliteCtor }>('better-sqlite3', 'npm i better-sqlite3');
+  return mod.default;
+}
+
+function resolveFile(creds: DbCredentials): string {
+  return typeof creds.url === 'string' && creds.url
+    ? path.resolve(process.cwd(), creds.url)
+    : ':memory:';
+}
+
 export async function readApplied(
   creds: DbCredentials,
   table: MigrationsTableRef,
 ): Promise<AppliedRow[]> {
-  const mod = await safeImport<{ default: SqliteCtor }>('better-sqlite3', 'npm i better-sqlite3');
-  const Database = mod.default;
-
-  const file = typeof creds.url === 'string' && creds.url
-    ? path.resolve(process.cwd(), creds.url)
-    : ':memory:';
-  const db = new Database(file, { readonly: true, fileMustExist: false });
+  const Database = await loadCtor();
+  const db = new Database(resolveFile(creds), { readonly: true, fileMustExist: false });
   try {
     const exists = db
       .prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name = ?`)
@@ -39,6 +50,52 @@ export async function readApplied(
       hash: String(r.hash),
       createdAt: Number(r.created_at),
     }));
+  } finally {
+    db.close();
+  }
+}
+
+export async function assertSchemaDbEmpty(_creds: DbCredentials): Promise<void> {
+  throw new Error('assertSchemaDbEmpty is not implemented for sqlite yet; only postgresql is supported.');
+}
+
+export async function resetAppliedToBaseline(
+  creds: DbCredentials,
+  table: MigrationsTableRef,
+  baseline: { hash: string; createdAt: number },
+  backupTable: string | null,
+): Promise<void> {
+  const Database = await loadCtor();
+  const db = new Database(resolveFile(creds), { fileMustExist: false });
+  try {
+    const qTable = quoteIdent(table.table);
+    db.exec(
+      `CREATE TABLE IF NOT EXISTS ${qTable} (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        hash TEXT NOT NULL,
+        created_at INTEGER
+      )`,
+    );
+
+    if (backupTable) {
+      const exists = db
+        .prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name = ?`)
+        .get(backupTable);
+      if (exists) {
+        throw new Error(`backup table ${backupTable} already exists; refusing to overwrite`);
+      }
+      const qBackup = quoteIdent(backupTable);
+      db.exec(`CREATE TABLE ${qBackup} AS SELECT * FROM ${qTable}`);
+    }
+
+    const tx = db.transaction(() => {
+      db.prepare(`DELETE FROM ${qTable}`).run();
+      db.prepare(`INSERT INTO ${qTable} (hash, created_at) VALUES (?, ?)`).run(
+        baseline.hash,
+        baseline.createdAt,
+      );
+    });
+    tx();
   } finally {
     db.close();
   }
