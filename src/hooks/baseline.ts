@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import {
   existsSync,
   mkdirSync,
@@ -26,8 +26,29 @@ import { preTarget } from './preTarget.js';
 
 const PREVIEW_PREFIX = '.baseline-preview-';
 const BAK_PREFIX = '.baseline-bak-';
+const REF_PREFIX = '.baseline-ref-';
 const SCHEMADB_INTRO_PREFIX = '.baseline-schemadbintro-';
 const ENV_SCHEMA_DB_URL = 'DRIZZLEMAN_EMPTY_SCHEMA_DB_URL';
+
+// Files that are NOT migrations themselves; they ship alongside the baseline
+// as reference material. Promoted into `.baseline-ref-<ts>/` rather than the
+// migrations dir proper.
+const REF_FILE_NAMES = new Set(['schema.ts', 'relations.ts', 'schema.sql']);
+
+const INTROSPECT_HEADER =
+  '-- Current sql file was generated after introspecting the database';
+
+// drizzle-kit introspect wraps its DDL inside `/* ... */` with a leading comment
+// nudging the user to uncomment it before running. That default makes 0000
+// useless as a fresh-environment baseline (drizzle-kit migrate would treat it
+// as no-op SQL on a new empty DB). Strip the wrapper so 0000 is executable.
+function uncommentIntrospectSql(sql: string): string {
+  if (!sql.startsWith(INTROSPECT_HEADER)) return sql;
+  const openIdx = sql.indexOf('/*');
+  const closeIdx = sql.lastIndexOf('*/');
+  if (openIdx === -1 || closeIdx === -1 || closeIdx <= openIdx) return sql;
+  return `${sql.slice(openIdx + 2, closeIdx).trim()}\n`;
+}
 
 interface BaselineFlags {
   yes: boolean;
@@ -619,6 +640,8 @@ export async function runBaseline(args: string[]): Promise<number> {
   const tmpDir = path.join(outDir, `${SCHEMADB_INTRO_PREFIX}${ts}`);
   const bakSlug = `baseline-bak-${ts}`;
   const bakDir = path.join(outDir, `.${bakSlug}`);
+  const refSlug = `baseline-ref-${ts}`;
+  const refDir = path.join(outDir, `.${refSlug}`);
   const bakTableLabel = `${table.schema ? `${table.schema}.` : ''}${bakSlug}`;
 
   if (!existsSync(outDir)) mkdirSync(outDir, { recursive: true });
@@ -645,6 +668,7 @@ export async function runBaseline(args: string[]): Promise<number> {
     (n) =>
       !n.startsWith(PREVIEW_PREFIX) &&
       !n.startsWith(BAK_PREFIX) &&
+      !n.startsWith(REF_PREFIX) &&
       !n.startsWith(SCHEMADB_INTRO_PREFIX),
   );
 
@@ -696,6 +720,17 @@ export async function runBaseline(args: string[]): Promise<number> {
     console.log(pc.dim(`  renamed ${renameInfo.oldTag} → ${renameInfo.newTag}`));
   }
   const baselineFile = path.join(previewDir, `${renameInfo.newTag}.sql`);
+  // Strip introspect's `/* ... */` wrapper so 0000 is real, executable DDL.
+  // (Hash must be computed AFTER this rewrite — drizzle-kit migrate stores
+  // sha256 of file content; mismatch would mark 0000 perpetually "pending".)
+  {
+    const raw = readFileSync(baselineFile, 'utf8');
+    const stripped = uncommentIntrospectSql(raw);
+    if (stripped !== raw) {
+      writeFileSync(baselineFile, stripped);
+      console.log(pc.dim('  unwrapped introspect /* ... */ so 0000 is executable'));
+    }
+  }
   const baselineHash = hashFile(baselineFile);
 
   // ---- Step B: assert schema DB is empty ----
@@ -830,17 +865,55 @@ export async function runBaseline(args: string[]): Promise<number> {
   const schemaDbChunks = chunkSql(readFileSync(schemaDbSqlPath, 'utf8'));
 
   // ---- Step G: write 0001_delta.sql + schema.sql ----
+  // 0001 only exists when there are real entities to migrate; empty diff means
+  // no idx=1 entry is appended (no orphan file in migrations/).
   const deltaSql = buildDeltaSql(schemaDbChunks, diff);
   const deltaFile = path.join(previewDir, '0001_delta.sql');
+  let deltaWritten = false;
   if (deltaSql.length > 0) {
     writeFileSync(deltaFile, `${deltaSql}\n`);
-  } else {
+    deltaWritten = true;
+
+    // Register 0001 in _journal.json so `drizzleman migrate` actually sees it.
+    const journalPath = path.join(previewDir, 'meta', '_journal.json');
+    const journalRaw = JSON.parse(readFileSync(journalPath, 'utf8')) as {
+      version: string;
+      dialect: string;
+      entries: Array<{
+        idx: number;
+        version?: string;
+        when: number;
+        tag: string;
+        breakpoints?: boolean;
+      }>;
+    };
+    const baselineEntry = journalRaw.entries.find((e) => e.idx === 0);
+    journalRaw.entries.push({
+      idx: 1,
+      version: baselineEntry?.version ?? journalRaw.version,
+      when: Date.now(),
+      tag: '0001_delta',
+      breakpoints: true,
+    });
+    writeFileSync(journalPath, JSON.stringify(journalRaw, null, 2));
+
+    // Write meta/0001_snapshot.json: structurally = schema-DB introspect snapshot
+    // (= post-0001 state), but with a fresh `id` and `prevId` pointing at 0000's
+    // id so drizzle-kit's chain validation stays sound for future generates.
+    const targetSnapshotPath = path.join(previewDir, 'meta', '0000_snapshot.json');
+    const schemaDbSnapshotPath = path.join(tmpDir, 'meta', '0000_snapshot.json');
+    const targetSnap = JSON.parse(readFileSync(targetSnapshotPath, 'utf8')) as {
+      id?: string;
+    };
+    const schemaDbSnap = JSON.parse(readFileSync(schemaDbSnapshotPath, 'utf8')) as Record<
+      string,
+      unknown
+    >;
+    schemaDbSnap.id = randomUUID();
+    schemaDbSnap.prevId = targetSnap.id ?? '';
     writeFileSync(
-      deltaFile,
-      `-- 0001_delta.sql
--- (generated by drizzleman baseline)
--- local schema introduces no new entities vs target DB; nothing to migrate.
-`,
+      path.join(previewDir, 'meta', '0001_snapshot.json'),
+      JSON.stringify(schemaDbSnap, null, 2),
     );
   }
   const schemaSql = buildSchemaSql(targetChunks, diff);
@@ -851,11 +924,24 @@ export async function runBaseline(args: string[]): Promise<number> {
   cleanupDir(tmpDir);
 
   console.log(pc.bold('\n[drizzleman] Preview artifacts:'));
-  for (const [label, file] of [
-    [`  0000 ${pc.dim('(target DB structure, will be marked applied)')}`, baselineFile] as const,
-    [`  0001 ${pc.dim('(delta from snapshot diff, PENDING)')}`, deltaFile] as const,
-    [`  schema.sql ${pc.dim('(target-only entities; not a migration — paste into your local schema)')}`, schemaFile] as const,
-  ]) {
+  const previewRows: Array<[string, string]> = [
+    [`  0000 ${pc.dim('(target DB structure, will be marked applied)')}`, baselineFile],
+  ];
+  if (deltaWritten) {
+    previewRows.push([
+      `  0001 ${pc.dim('(delta from snapshot diff, PENDING — `drizzleman migrate` will apply)')}`,
+      deltaFile,
+    ]);
+  } else {
+    console.log(
+      pc.dim('  0001: ✓ no delta — local schema matches target; no migration file written.'),
+    );
+  }
+  previewRows.push([
+    `  schema.sql ${pc.dim('(target-only entities; reference only — paste into your local schema)')}`,
+    schemaFile,
+  ]);
+  for (const [label, file] of previewRows) {
     const size = statSync(file).size;
     const lines = countLines(file);
     console.log(`${label}: ${pc.cyan(rel(file))}  ${pc.dim(`${fmtBytes(size)} / ${lines} lines`)}`);
@@ -912,13 +998,24 @@ export async function runBaseline(args: string[]): Promise<number> {
     console.log(pc.dim('  (no existing migrations to back up)'));
   }
 
-  // J2: promote preview into migrations dir
-  console.log(`  promoting preview → ${rel(outDir)}/`);
+  // J2: promote preview — split into migrations (sql + meta) and ref dir
+  // (schema.ts / relations.ts / schema.sql) to keep migrations/ clean.
+  console.log(`  promoting preview → ${rel(outDir)}/ (sql + meta) + ${rel(refDir)}/ (refs)`);
   try {
+    let refMoved = 0;
     for (const entry of readdirSync(previewDir)) {
-      renameSync(path.join(previewDir, entry), path.join(outDir, entry));
+      if (REF_FILE_NAMES.has(entry)) {
+        if (refMoved === 0) mkdirSync(refDir, { recursive: true });
+        renameSync(path.join(previewDir, entry), path.join(refDir, entry));
+        refMoved++;
+      } else {
+        renameSync(path.join(previewDir, entry), path.join(outDir, entry));
+      }
     }
     rmdirSync(previewDir);
+    if (refMoved > 0) {
+      console.log(pc.dim(`  ✓ ${refMoved} reference file(s) → ${rel(refDir)}/`));
+    }
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     console.log(pc.red(`  ✗ promotion failed mid-flight: ${msg}`));
@@ -956,9 +1053,14 @@ export async function runBaseline(args: string[]): Promise<number> {
   console.log(pc.green(`  ✓ ${tableLabel} reset; old rows preserved in ${bakTableLabel}`));
 
   console.log(pc.green('\n[drizzleman] ✓ baseline complete.'));
-  console.log(`  next: ${pc.bold('drizzleman migrate')} to apply 0001_delta.sql (if non-empty)`);
+  if (deltaWritten) {
+    console.log(`  next: ${pc.bold('drizzleman migrate')} to apply 0001_delta.sql against target.`);
+  } else {
+    console.log(pc.dim('  no pending migration; local schema already matches target.'));
+  }
   console.log(pc.dim(`  fs backup:  ${rel(bakDir)}/`));
   console.log(pc.dim(`  db backup:  ${bakTableLabel}`));
+  if (existsSync(refDir)) console.log(pc.dim(`  reference:  ${rel(refDir)}/ (schema.ts / relations.ts / schema.sql)`));
   printSchemaDbReminder(schemaDbUrl);
   return 0;
 }
