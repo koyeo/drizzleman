@@ -922,28 +922,52 @@ export async function runBaseline(args: string[]): Promise<number> {
     });
     writeFileSync(journalPath, JSON.stringify(journalRaw, null, 2));
 
-    // Write meta/0001_snapshot.json: structurally = schema-DB introspect snapshot
-    // (= post-0001 state), but with a fresh `id` and `prevId` pointing at 0000's
-    // id so drizzle-kit's chain validation stays sound for future generates.
+    // Write meta/0001_snapshot.json from tmpgen (drizzle-kit generate's own
+    // serialization of local schema). Using introspect's snapshot (tmpDir)
+    // would be structurally equivalent but textually different, which would
+    // make the NEXT `drizzle-kit generate` emit a spurious renaming-style diff.
     const targetSnapshotPath = path.join(previewDir, 'meta', '0000_snapshot.json');
-    const schemaDbSnapshotPath = path.join(tmpDir, 'meta', '0000_snapshot.json');
+    const tmpgenSnapshotPath = path.join(tmpgenDir, 'meta', '0000_snapshot.json');
     const targetSnap = JSON.parse(readFileSync(targetSnapshotPath, 'utf8')) as {
       id?: string;
     };
-    const schemaDbSnap = JSON.parse(readFileSync(schemaDbSnapshotPath, 'utf8')) as Record<
+    const tmpgenSnap = JSON.parse(readFileSync(tmpgenSnapshotPath, 'utf8')) as Record<
       string,
       unknown
     >;
-    schemaDbSnap.id = randomUUID();
-    schemaDbSnap.prevId = targetSnap.id ?? '';
+    tmpgenSnap.id = randomUUID();
+    tmpgenSnap.prevId = targetSnap.id ?? '';
     writeFileSync(
       path.join(previewDir, 'meta', '0001_snapshot.json'),
-      JSON.stringify(schemaDbSnap, null, 2),
+      JSON.stringify(tmpgenSnap, null, 2),
     );
   }
   const schemaSql = buildSchemaSql(targetChunks, diff);
   const schemaFile = path.join(previewDir, 'schema.sql');
   writeFileSync(schemaFile, schemaSql);
+
+  // Zero-diff case: replace meta/0000_snapshot.json with tmpgen's snapshot
+  // (preserving 0000's id/prevId so the chain stays anchored at the same point).
+  // Otherwise a future `drizzle-kit generate` would diff local schema against
+  // introspect's text-different snapshot and emit a spurious migration even
+  // though nothing structurally changed.
+  if (!deltaWritten) {
+    const baselineSnapshotPath = path.join(previewDir, 'meta', '0000_snapshot.json');
+    const tmpgenSnapshotPath = path.join(tmpgenDir, 'meta', '0000_snapshot.json');
+    if (existsSync(tmpgenSnapshotPath)) {
+      const oldSnap = JSON.parse(readFileSync(baselineSnapshotPath, 'utf8')) as {
+        id?: string;
+        prevId?: string;
+      };
+      const tmpgenSnap = JSON.parse(readFileSync(tmpgenSnapshotPath, 'utf8')) as Record<
+        string,
+        unknown
+      >;
+      tmpgenSnap.id = oldSnap.id ?? randomUUID();
+      tmpgenSnap.prevId = oldSnap.prevId ?? '';
+      writeFileSync(baselineSnapshotPath, JSON.stringify(tmpgenSnap, null, 2));
+    }
+  }
 
   // ---- Step H: cleanup tmpDir, render preview ----
   cleanupDir(tmpDir);
