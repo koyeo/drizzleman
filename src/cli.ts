@@ -2,7 +2,7 @@
 import { passthrough } from './passthrough.js';
 import { runHook } from './hooks/index.js';
 
-const HOOK_COMMANDS = new Set(['generate', 'migrate', 'push', 'check-migrations', 'check-chain', 'align', 'renumber', 'baseline']);
+const HOOK_COMMANDS = new Set(['generate', 'migrate', 'push', 'check-migrations', 'check-chain', 'align', 'renumber', 'rebase', 'info']);
 
 async function main(): Promise<number> {
   const args = process.argv.slice(2);

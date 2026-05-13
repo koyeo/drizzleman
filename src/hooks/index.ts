@@ -1,10 +1,11 @@
 import { runAlign } from './align.js';
-import { runBaseline } from './baseline.js';
 import { runCheckChain } from './checkChain.js';
 import { runCheckMigrations } from './checkMigrations.js';
 import { runGenerate } from './generate.js';
+import { runInfo } from './info.js';
 import { runMigrate } from './migrate.js';
 import { runPush } from './push.js';
+import { runRebase } from './rebase.js';
 import { runRenumber } from './renumber.js';
 
 function consumeYesFlag(args: string[]): { yes: boolean; rest: string[] } {
@@ -38,8 +39,10 @@ export async function runHook(cmd: string, args: string[]): Promise<number> {
       return runAlign(args);
     case 'renumber':
       return runRenumber(args);
-    case 'baseline':
-      return runBaseline(args);
+    case 'rebase':
+      return runRebase(args);
+    case 'info':
+      return runInfo(args);
     default:
       throw new Error(`unknown hook command: ${cmd}`);
   }

@@ -54,10 +54,10 @@ export async function assertSchemaDbEmpty(_creds: DbCredentials): Promise<void> 
   throw new Error('assertSchemaDbEmpty is not implemented for mysql yet; only postgresql is supported.');
 }
 
-export async function resetAppliedToBaseline(
+export async function resetAppliedToRebase(
   creds: DbCredentials,
   table: MigrationsTableRef,
-  baseline: { hash: string; createdAt: number },
+  rebase: { hash: string; createdAt: number },
   backupTable: string | null,
 ): Promise<void> {
   const conn = await connect(creds);
@@ -89,7 +89,7 @@ export async function resetAppliedToBaseline(
       await conn.query(`TRUNCATE TABLE ${schemaPrefix}${qTable}`);
       await conn.execute(
         `INSERT INTO ${schemaPrefix}${qTable} (hash, created_at) VALUES (?, ?)`,
-        [baseline.hash, baseline.createdAt],
+        [rebase.hash, rebase.createdAt],
       );
       await conn.commit();
     } catch (err) {

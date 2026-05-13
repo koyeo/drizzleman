@@ -80,10 +80,10 @@ export async function assertSchemaDbEmpty(creds: DbCredentials): Promise<void> {
   }
 }
 
-export async function resetAppliedToBaseline(
+export async function resetAppliedToRebase(
   creds: DbCredentials,
   table: MigrationsTableRef,
-  baseline: { hash: string; createdAt: number },
+  rebase: { hash: string; createdAt: number },
   backupTable: string | null,
 ): Promise<void> {
   const client = await connect(creds);
@@ -117,7 +117,7 @@ export async function resetAppliedToBaseline(
       await client.query(`TRUNCATE TABLE ${qSchema}.${qTable} RESTART IDENTITY`);
       await client.query(
         `INSERT INTO ${qSchema}.${qTable} (hash, created_at) VALUES ($1, $2)`,
-        [baseline.hash, baseline.createdAt],
+        [rebase.hash, rebase.createdAt],
       );
       await client.query('COMMIT');
     } catch (err) {

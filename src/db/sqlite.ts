@@ -59,10 +59,10 @@ export async function assertSchemaDbEmpty(_creds: DbCredentials): Promise<void> 
   throw new Error('assertSchemaDbEmpty is not implemented for sqlite yet; only postgresql is supported.');
 }
 
-export async function resetAppliedToBaseline(
+export async function resetAppliedToRebase(
   creds: DbCredentials,
   table: MigrationsTableRef,
-  baseline: { hash: string; createdAt: number },
+  rebase: { hash: string; createdAt: number },
   backupTable: string | null,
 ): Promise<void> {
   const Database = await loadCtor();
@@ -91,8 +91,8 @@ export async function resetAppliedToBaseline(
     const tx = db.transaction(() => {
       db.prepare(`DELETE FROM ${qTable}`).run();
       db.prepare(`INSERT INTO ${qTable} (hash, created_at) VALUES (?, ?)`).run(
-        baseline.hash,
-        baseline.createdAt,
+        rebase.hash,
+        rebase.createdAt,
       );
     });
     tx();

@@ -49,25 +49,25 @@ export async function assertSchemaDbEmpty(
   }
 }
 
-export async function resetAppliedToBaseline(
+export async function resetAppliedToRebase(
   dialect: Dialect,
   creds: DbCredentials,
   table: MigrationsTableRef,
-  baseline: { hash: string; createdAt: number },
+  rebase: { hash: string; createdAt: number },
   backupTable: string | null,
 ): Promise<void> {
   switch (dialect) {
     case 'postgresql': {
-      const { resetAppliedToBaseline } = await import('./pg.js');
-      return resetAppliedToBaseline(creds, table, baseline, backupTable);
+      const { resetAppliedToRebase } = await import('./pg.js');
+      return resetAppliedToRebase(creds, table, rebase, backupTable);
     }
     case 'mysql': {
-      const { resetAppliedToBaseline } = await import('./mysql.js');
-      return resetAppliedToBaseline(creds, table, baseline, backupTable);
+      const { resetAppliedToRebase } = await import('./mysql.js');
+      return resetAppliedToRebase(creds, table, rebase, backupTable);
     }
     case 'sqlite': {
-      const { resetAppliedToBaseline } = await import('./sqlite.js');
-      return resetAppliedToBaseline(creds, table, baseline, backupTable);
+      const { resetAppliedToRebase } = await import('./sqlite.js');
+      return resetAppliedToRebase(creds, table, rebase, backupTable);
     }
     default: {
       const _exhaustive: never = dialect;
