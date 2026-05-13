@@ -269,10 +269,8 @@ async function resolveTempDbUrls(
   if (adminFromUser !== null) {
     await checkCreateDbPrivilege(adminFromUser);
     const tsName = timestampForDbName(ts);
-    const schemaName = `drizzleman_schema_${tsName}`;
-    // Literal naming per spec — verify segment has no underscore between
-    // `db` and the timestamp.
-    const verifyName = `drizzleman_verify_db${tsName}`;
+    const schemaName = `drizzleman_${tsName}_schema_db`;
+    const verifyName = `drizzleman_${tsName}_verify_db`;
     console.log(pc.bold('[drizzleman] Admin-mode: creating two temp databases'));
     console.log(pc.dim(`  via ${pc.cyan(maskUrl(adminFromUser))}`));
     try {
@@ -1055,9 +1053,14 @@ export async function runRebase(args: string[]): Promise<number> {
     pc.dim(`  target.dump.sql: ${rel(targetDumpPath)} (${fmtBytes(dumpResult.byteCount)})`),
   );
 
-  // ---- Step D: migra <target> <schema_db> → 0001_diff.sql ----
-  console.log(pc.bold('\n[drizzleman] Step D: migra <target> <schema_db> → 0001_diff.sql'));
-  const diffPath = path.join(previewDir, '0001_diff.sql');
+  // ---- Step D: migra <target> <schema_db> → {ts}_rebase_diff_only.sql ----
+  //
+  // Naming signals intent: this file is a RECORD of the target→schema delta
+  // for human review (and manual `psql target -f`). It is NOT registered in
+  // _journal.json and drizzleman never executes it — see CLAUDE.md G2.
+  const diffOnlyBase = `${tsLabel}_rebase_diff_only.sql`;
+  console.log(pc.bold(`\n[drizzleman] Step D: migra <target> <schema_db> → ${diffOnlyBase}`));
+  const diffPath = path.join(previewDir, diffOnlyBase);
   const diffResult = await runMigraToFile(targetUrlNorm, schemaDbUrl, migraExcludes, diffPath);
   if (!diffResult.ok) {
     console.log(pc.red(`[drizzleman] ✗ migra (target → schema) failed: ${diffResult.error}`));
@@ -1067,7 +1070,7 @@ export async function runRebase(args: string[]): Promise<number> {
     return 1;
   }
   let diffBytes = diffResult.byteCount;
-  console.log(pc.dim(`  0001_diff.sql: ${rel(diffPath)} (${fmtBytes(diffBytes)})`));
+  console.log(pc.dim(`  ${diffOnlyBase}: ${rel(diffPath)} (${fmtBytes(diffBytes)})`));
 
   // Post-process: repair migra's incomplete enum-rename CHECK handling.
   try {
@@ -1100,7 +1103,7 @@ export async function runRebase(args: string[]): Promise<number> {
       destructive.dropOther +
       destructive.alterDrop;
     console.log(
-      pc.red(`  ⚠ 0001_diff.sql contains ${sum} destructive DDL statement(s):`),
+      pc.red(`  ⚠ ${diffOnlyBase} contains ${sum} destructive DDL statement(s):`),
     );
     if (destructive.dropTable) console.log(pc.red(`      DROP TABLE       × ${destructive.dropTable}`));
     if (destructive.dropColumn) console.log(pc.red(`      DROP COLUMN      × ${destructive.dropColumn}`));
@@ -1116,7 +1119,7 @@ export async function runRebase(args: string[]): Promise<number> {
       ),
     );
   } else {
-    console.log(pc.green('  ✓ no destructive DDL in 0001_diff.sql'));
+    console.log(pc.green(`  ✓ no destructive DDL in ${diffOnlyBase}`));
   }
 
   // ---- Step V: verify gate ----
@@ -1133,14 +1136,14 @@ export async function runRebase(args: string[]): Promise<number> {
   }
   console.log(pc.green('    ✓ target dump applied to verify DB'));
 
-  // V2: pour 0001_diff.sql into verify DB → verify DB now ≈ target + diff.
-  console.log(pc.bold('  V2 (命题 ②): apply 0001_diff.sql to verify DB'));
+  // V2: pour {ts}_rebase_diff_only.sql into verify DB → verify DB now ≈ target + diff.
+  console.log(pc.bold(`  V2 (命题 ②): apply ${diffOnlyBase} to verify DB`));
   if (diffBytes === 0) {
     console.log(pc.dim('    (diff is empty — V2 trivially holds)'));
   } else {
     const v2 = await runSqlFile(verifyDbUrl, diffPath);
     if (!v2.ok) {
-      reportSqlFailure(v2, 'V2: 0001_diff.sql');
+      reportSqlFailure(v2, `V2: ${diffOnlyBase}`);
       cleanupDir(tmpgenDir);
       console.log(pc.red('\n[drizzleman] ✗ verify failed at V2; preview retained.'));
       printDbReminders(schemaDbUrl, verifyDbUrl, provisioned);
@@ -1176,8 +1179,8 @@ export async function runRebase(args: string[]): Promise<number> {
     [`  0000 ${pc.dim('(local schema baseline, will be marked applied)')}`, baselineFile],
     [`  target.dump.sql ${pc.dim('(target structure dump for verify; not promoted)')}`, targetDumpPath],
     [
-      `  0001_diff.sql ${pc.dim(
-        '(target → schema migration; PENDING — MUST be applied MANUALLY via `psql target -f`)',
+      `  ${diffOnlyBase} ${pc.dim(
+        '(target → schema delta; record-only — NOT in _journal.json. MUST be applied MANUALLY via `psql target -f`)',
       )}`,
       diffPath,
     ],
@@ -1237,12 +1240,15 @@ export async function runRebase(args: string[]): Promise<number> {
     console.log(pc.dim('  (no existing migrations to back up)'));
   }
 
-  // J2: promote preview — copy 0000 + meta into migrations dir, plus
-  // 0001_diff.sql as a pending migration with a `manual: true` journal
-  // marker. target.dump.sql stays in previewDir (not promoted to out/).
+  // J2: promote preview — move 0000 sql + meta into the migrations dir, plus
+  // {ts}_rebase_diff_only.sql alongside them as a record-only artifact. The
+  // diff is intentionally NOT added to _journal.json: drizzleman never runs
+  // it, and there is no hash to register (the user `psql`'s it by hand and
+  // the next normal `drizzle-kit generate` will roll any further drift into
+  // a regular migration). target.dump.sql is moved to refDir for inspection.
+  const finalDiffPath = path.join(outDir, diffOnlyBase);
   console.log(`  promoting preview → ${rel(outDir)}/`);
   try {
-    // Move 0000 sql + meta dir.
     renameSync(baselineFile, path.join(outDir, desiredSqlBase));
     const metaSrc = path.join(previewDir, 'meta');
     const metaDst = path.join(outDir, 'meta');
@@ -1251,29 +1257,8 @@ export async function runRebase(args: string[]): Promise<number> {
       renameSync(path.join(metaSrc, f), path.join(metaDst, f));
     }
     rmdirSync(metaSrc);
-    // Move 0001_diff.sql.
-    renameSync(diffPath, path.join(outDir, '0001_diff.sql'));
+    renameSync(diffPath, finalDiffPath);
 
-    // Append 0001_diff entry into journal with `manual: true` so
-    // `drizzleman migrate` registers its hash without executing the SQL.
-    const finalJournalPath = path.join(outDir, 'meta', '_journal.json');
-    const finalJournal = JSON.parse(readFileSync(finalJournalPath, 'utf8')) as {
-      entries: Array<Record<string, unknown>>;
-      version?: string;
-    };
-    finalJournal.entries.push({
-      idx: 1,
-      version: finalJournal.version ?? '7',
-      when: Date.now(),
-      tag: '0001_diff',
-      breakpoints: true,
-      // Non-standard field: drizzleman-only — see CLAUDE.md G2/G6.
-      manual: true,
-    });
-    writeFileSync(finalJournalPath, JSON.stringify(finalJournal, null, 2));
-
-    // What remains in previewDir is just target.dump.sql + .drizzle.config.schemadb.json
-    // — move target.dump.sql to refDir for inspection, drop the config.
     if (existsSync(targetDumpPath)) {
       mkdirSync(refDir, { recursive: true });
       renameSync(targetDumpPath, path.join(refDir, 'target.dump.sql'));
@@ -1293,9 +1278,10 @@ export async function runRebase(args: string[]): Promise<number> {
   }
   console.log(pc.green('  ✓ preview promoted'));
 
-  // J3: reset DB migration table — only 0000 hash is inserted as applied.
-  // The 0001_diff hash will be inserted later when the user runs
-  // `drizzleman migrate` AFTER they manually `psql target -f 0001_diff.sql`.
+  // J3: reset DB migration table — only the 0000 hash is inserted as applied.
+  // The rebase diff-only file is record-only (not journaled), so no further
+  // hash gets registered for it; future drift lands in the next normal
+  // generate cycle.
   console.log(`  resetting ${tableLabel} (backup → ${bakTableLabel})`);
   try {
     await resetAppliedToRebase(
@@ -1324,14 +1310,14 @@ export async function runRebase(args: string[]): Promise<number> {
   console.log(pc.green('\n[drizzleman] ✓ rebase complete.'));
   console.log(
     pc.bold(
-      `  next: review ${pc.cyan(rel(path.join(outDir, '0001_diff.sql')))} ` +
-        `then ${pc.cyan(`psql <target> -f ${rel(path.join(outDir, '0001_diff.sql'))}`)} manually.`,
+      `  next: review ${pc.cyan(rel(finalDiffPath))} ` +
+        `then ${pc.cyan(`psql <target> -f ${rel(finalDiffPath)}`)} manually.`,
     ),
   );
   console.log(
     pc.dim(
-      '  After applying to target, run `drizzleman migrate` to register the 0001_diff hash. ' +
-        'drizzleman will NEVER execute diff.sql against target itself (CLAUDE.md G2/G6).',
+      `  ${diffOnlyBase} is record-only (NOT in _journal.json). drizzleman will NEVER ` +
+        'execute it against target — CLAUDE.md G2.',
     ),
   );
   console.log(pc.dim(`  fs backup:  ${rel(bakDir)}/`));

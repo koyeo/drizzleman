@@ -27,14 +27,14 @@ async function connect(url: string): Promise<PgClient> {
 }
 
 export function timestampForDbName(ms: number): string {
-  // Local-timezone YYYYMMDD_HHmmss, paired with the same `ts = Date.now()`
-  // used for the filesystem preview/bak/ref directories so the two are
-  // always recoverable as a pair.
+  // Local-timezone YYYYMMDDHHmmss (compact 14-digit), paired with the same
+  // `ts = Date.now()` used for filesystem preview/bak/ref dirs and the
+  // rebase diff-only record file so the four are recoverable as a set.
   const d = new Date(ms);
   const p = (n: number): string => String(n).padStart(2, '0');
   return (
     `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}` +
-    `_${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`
+    `${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`
   );
 }
 
