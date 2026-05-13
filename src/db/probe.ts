@@ -188,22 +188,26 @@ async function probeSqlite(creds: DbCredentials): Promise<DbProbe> {
   }
 }
 
-// Identifies a standalone index (not backing any PK/UNIQUE constraint) as
-// seen by Postgres itself. Useful as a fallback for drizzle-kit introspect
-// when it silently drops indexes from its output (a known 0.31.x bug:
-// some `<table>_<col>_key`-style unique indexes never make it into the
-// introspect SQL / snapshot, leaving FKs that reference them un-applyable).
-export interface StandaloneIndexInfo {
-  schemaName: string;
-  tableName: string;
-  indexName: string;
-  // pg_get_indexdef(oid) output — canonical CREATE INDEX statement (no `;`).
-  indexDef: string;
+// CHECK constraints whose predicate text references any of the given enum
+// types. Used to repair migra's enum-rename block: when migra renames an
+// enum (to `<name>__old_version_to_be_dropped`), any CHECK that compared
+// values against `'foo'::enum_name` still binds to the OLD (now-renamed)
+// enum oid; subsequent `ALTER COLUMN ... TYPE new_enum` then fails with
+// "operator does not exist: <new> = <old>". Drop these CHECKs before the
+// rename block, re-add them after the column alters.
+export interface CheckReferencingEnum {
+  schema: string;
+  table: string;
+  name: string;
+  // pg_get_constraintdef output, e.g. `CHECK ((status = 'completed'::scan_status) ...)`
+  definition: string;
 }
 
-export async function listStandalonePgIndexes(
+export async function listChecksReferencingEnums(
   creds: DbCredentials,
-): Promise<StandaloneIndexInfo[]> {
+  enumQualifiedNames: string[],
+): Promise<CheckReferencingEnum[]> {
+  if (enumQualifiedNames.length === 0) return [];
   const pgMod = await safeImport<{
     default?: { Client: new (cfg: unknown) => unknown };
     Client?: new (cfg: unknown) => unknown;
@@ -213,138 +217,57 @@ export async function listStandalonePgIndexes(
   const client = new Client(cfg);
   await client.connect();
   try {
-    // The LEFT JOIN must restrict to constraint types `p` (PRIMARY KEY) and
-    // `u` (UNIQUE). Without that restriction, FK constraints — whose
-    // `conindid` points to the unique index on the REFERENCED table — would
-    // mistakenly mark a perfectly standalone unique index as "backing a
-    // constraint" and we'd skip it. That's how `scans_request_id_key`
-    // disappeared from the supplement candidate set: the FK
-    // `scan_runtime_credentials.request_id → scans(request_id)` has its
-    // `conindid` set to this very index.
+    // CHECK constraint depends on a type via pg_depend (refclassid =
+    // 'pg_type'::regclass). Filter to the enum types we care about.
     const res = await client.query(
-      `SELECT
-         n.nspname AS schema_name,
-         t.relname AS table_name,
-         i.relname AS index_name,
-         pg_get_indexdef(i.oid) AS index_def
-       FROM pg_index ix
-       JOIN pg_class i ON i.oid = ix.indexrelid
-       JOIN pg_class t ON t.oid = ix.indrelid
-       JOIN pg_namespace n ON n.oid = t.relnamespace
-       LEFT JOIN pg_constraint c
-         ON c.conindid = i.oid AND c.contype IN ('p', 'u')
-       WHERE n.nspname NOT IN ('pg_catalog', 'information_schema')
-         AND n.nspname NOT LIKE 'pg_toast%'
-         AND n.nspname NOT LIKE 'pg_temp_%'
-         AND c.conindid IS NULL
-       ORDER BY n.nspname, t.relname, i.relname`,
+      `WITH wanted AS (
+         SELECT t.oid AS type_oid, n.nspname AS type_schema, t.typname AS type_name
+         FROM pg_type t
+         JOIN pg_namespace n ON n.oid = t.typnamespace
+         WHERE format('%I.%I', n.nspname, t.typname) = ANY($1)
+       )
+       SELECT
+         tn.nspname AS table_schema,
+         tc.relname AS table_name,
+         c.conname AS constraint_name,
+         pg_get_constraintdef(c.oid) AS def
+       FROM pg_constraint c
+       JOIN pg_class tc ON tc.oid = c.conrelid
+       JOIN pg_namespace tn ON tn.oid = tc.relnamespace
+       JOIN pg_depend d ON d.objid = c.oid AND d.refclassid = 'pg_type'::regclass
+       JOIN wanted w ON w.type_oid = d.refobjid
+       WHERE c.contype = 'c'
+       GROUP BY tn.nspname, tc.relname, c.conname, c.oid
+       ORDER BY tn.nspname, tc.relname, c.conname`,
+      [enumQualifiedNames],
     );
     return res.rows.map((r) => ({
-      schemaName: String(r.schema_name),
-      tableName: String(r.table_name),
-      indexName: String(r.index_name),
-      indexDef: String(r.index_def),
+      schema: String(r.table_schema),
+      table: String(r.table_name),
+      name: String(r.constraint_name),
+      definition: String(r.def),
     }));
   } finally {
     await client.end();
   }
 }
 
-// Authoritative enum-value listing from the live DB. drizzle-kit 0.31.x
-// introspect occasionally drops enum values from its CREATE TYPE output
-// (and from its snapshot.enums entry) while keeping CHECK constraints /
-// column defaults that reference them — that produces 0000 SQL which fails
-// at apply time with "invalid input value for enum".
-export interface PgEnumInfo {
-  schema: string;
-  name: string;
-  values: string[];
-}
-
-export async function listPgEnums(creds: DbCredentials): Promise<PgEnumInfo[]> {
-  const pgMod = await safeImport<{
-    default?: { Client: new (cfg: unknown) => unknown };
-    Client?: new (cfg: unknown) => unknown;
-  }>('pg', 'npm i pg');
-  const Client = (pgMod.default?.Client ?? pgMod.Client) as new (cfg: unknown) => PgClientShape;
-  const cfg: Record<string, unknown> = creds.url ? { connectionString: creds.url } : { ...creds };
-  const client = new Client(cfg);
-  await client.connect();
-  try {
-    const res = await client.query(
-      // Cast enumlabel to text so node-postgres parses array_agg as text[]
-      // (a JS array). Without the cast it comes back as the literal string
-      // `{val1,val2,...}` because pg-types lacks a parser for the underlying
-      // `name`/anyenum array OID.
-      `SELECT
-         n.nspname AS schema_name,
-         t.typname AS enum_name,
-         array_agg(e.enumlabel::text ORDER BY e.enumsortorder) AS enum_values
-       FROM pg_type t
-       JOIN pg_enum e ON e.enumtypid = t.oid
-       JOIN pg_namespace n ON n.oid = t.typnamespace
-       WHERE n.nspname NOT IN ('pg_catalog', 'information_schema')
-       GROUP BY n.nspname, t.typname
-       ORDER BY n.nspname, t.typname`,
-    );
-    return res.rows.map((r) => ({
-      schema: String(r.schema_name),
-      name: String(r.enum_name),
-      values: (r.enum_values as string[]).map(String),
-    }));
-  } finally {
-    await client.end();
-  }
-}
-
-// Installed (non-builtin) extensions on the target. drizzle-kit introspect
-// emits NO `CREATE EXTENSION` statements, so applying 0000 to a fresh DB
-// silently lacks any extension that the schema actually depends on
-// (pgcrypto's `gen_random_uuid()`, postgis types, hstore, etc.).
-export interface PgExtensionInfo {
-  name: string;
-  schema: string;
-}
-
-export async function listPgExtensions(creds: DbCredentials): Promise<PgExtensionInfo[]> {
-  const pgMod = await safeImport<{
-    default?: { Client: new (cfg: unknown) => unknown };
-    Client?: new (cfg: unknown) => unknown;
-  }>('pg', 'npm i pg');
-  const Client = (pgMod.default?.Client ?? pgMod.Client) as new (cfg: unknown) => PgClientShape;
-  const cfg: Record<string, unknown> = creds.url ? { connectionString: creds.url } : { ...creds };
-  const client = new Client(cfg);
-  await client.connect();
-  try {
-    const res = await client.query(
-      // plpgsql ships with postgres itself; skip it.
-      `SELECT e.extname, n.nspname AS schema_name
-       FROM pg_extension e
-       JOIN pg_namespace n ON n.oid = e.extnamespace
-       WHERE e.extname <> 'plpgsql'
-       ORDER BY e.extname`,
-    );
-    return res.rows.map((r) => ({
-      name: String(r.extname),
-      schema: String(r.schema_name),
-    }));
-  } finally {
-    await client.end();
-  }
-}
-
-// Live column-default lookup. drizzle-kit introspect occasionally mangles
-// defaults — most commonly `'{}'::text[]` (empty array) gets serialized as
-// `'{""}'` (single-element empty-string array). pg_attrdef + pg_get_expr is
-// the authoritative source.
-export interface PgColumnDefault {
+// Column DEFAULT expressions that bind to any of the given enum types. After
+// `ALTER TYPE ... RENAME` migra issues for enum-shrink, these defaults still
+// point at the OLD (now-renamed) enum oid, and the subsequent ALTER COLUMN
+// TYPE fails. Drop them before the rename; migra re-issues SET DEFAULT
+// against the new enum further down the diff.
+export interface ColumnDefaultRef {
   schema: string;
   table: string;
   column: string;
-  defaultExpr: string;
 }
 
-export async function listPgColumnDefaults(creds: DbCredentials): Promise<PgColumnDefault[]> {
+export async function listDefaultsReferencingEnums(
+  creds: DbCredentials,
+  enumQualifiedNames: string[],
+): Promise<ColumnDefaultRef[]> {
+  if (enumQualifiedNames.length === 0) return [];
   const pgMod = await safeImport<{
     default?: { Client: new (cfg: unknown) => unknown };
     Client?: new (cfg: unknown) => unknown;
@@ -355,24 +278,93 @@ export async function listPgColumnDefaults(creds: DbCredentials): Promise<PgColu
   await client.connect();
   try {
     const res = await client.query(
-      `SELECT
-         n.nspname AS schema_name,
-         t.relname AS table_name,
-         a.attname AS column_name,
-         pg_get_expr(d.adbin, d.adrelid) AS default_expr
+      `WITH wanted AS (
+         SELECT t.oid AS type_oid
+         FROM pg_type t
+         JOIN pg_namespace n ON n.oid = t.typnamespace
+         WHERE format('%I.%I', n.nspname, t.typname) = ANY($1)
+       )
+       SELECT
+         n.nspname AS table_schema,
+         c.relname AS table_name,
+         a.attname AS column_name
        FROM pg_attrdef d
+       JOIN pg_depend dep ON dep.objid = d.oid
+         AND dep.classid = 'pg_attrdef'::regclass
+         AND dep.refclassid = 'pg_type'::regclass
+       JOIN wanted w ON w.type_oid = dep.refobjid
        JOIN pg_attribute a ON a.attrelid = d.adrelid AND a.attnum = d.adnum
-       JOIN pg_class t ON t.oid = a.attrelid AND t.relkind IN ('r','p')
-       JOIN pg_namespace n ON n.oid = t.relnamespace
-       WHERE n.nspname NOT IN ('pg_catalog', 'information_schema')
-         AND NOT a.attisdropped
-       ORDER BY n.nspname, t.relname, a.attnum`,
+       JOIN pg_class c ON c.oid = a.attrelid
+       JOIN pg_namespace n ON n.oid = c.relnamespace
+       GROUP BY n.nspname, c.relname, a.attname
+       ORDER BY n.nspname, c.relname, a.attname`,
+      [enumQualifiedNames],
     );
     return res.rows.map((r) => ({
-      schema: String(r.schema_name),
+      schema: String(r.table_schema),
       table: String(r.table_name),
       column: String(r.column_name),
-      defaultExpr: String(r.default_expr),
+    }));
+  } finally {
+    await client.end();
+  }
+}
+
+// Indexes whose definition (typically a partial-index WHERE clause)
+// references any of the given enum types. After migra's enum rename, such
+// indexes still bind to the OLD (renamed) enum oid; subsequent column
+// ALTER fails with the same `operator does not exist` error as CHECK
+// constraints. Drop them before the rename, re-add (via pg_get_indexdef)
+// after the column alters.
+export interface IndexReferencingEnum {
+  schema: string;
+  table: string;
+  name: string;
+  // pg_get_indexdef output — canonical CREATE INDEX statement (no trailing `;`).
+  definition: string;
+}
+
+export async function listIndexesReferencingEnums(
+  creds: DbCredentials,
+  enumQualifiedNames: string[],
+): Promise<IndexReferencingEnum[]> {
+  if (enumQualifiedNames.length === 0) return [];
+  const pgMod = await safeImport<{
+    default?: { Client: new (cfg: unknown) => unknown };
+    Client?: new (cfg: unknown) => unknown;
+  }>('pg', 'npm i pg');
+  const Client = (pgMod.default?.Client ?? pgMod.Client) as new (cfg: unknown) => PgClientShape;
+  const cfg: Record<string, unknown> = creds.url ? { connectionString: creds.url } : { ...creds };
+  const client = new Client(cfg);
+  await client.connect();
+  try {
+    const res = await client.query(
+      `WITH wanted AS (
+         SELECT t.oid AS type_oid
+         FROM pg_type t
+         JOIN pg_namespace n ON n.oid = t.typnamespace
+         WHERE format('%I.%I', n.nspname, t.typname) = ANY($1)
+       )
+       SELECT
+         n.nspname AS table_schema,
+         tc.relname AS table_name,
+         ic.relname AS index_name,
+         pg_get_indexdef(ic.oid) AS def
+       FROM pg_index ix
+       JOIN pg_class ic ON ic.oid = ix.indexrelid
+       JOIN pg_class tc ON tc.oid = ix.indrelid
+       JOIN pg_namespace n ON n.oid = tc.relnamespace
+       JOIN pg_depend d ON d.objid = ic.oid AND d.refclassid = 'pg_type'::regclass
+       JOIN wanted w ON w.type_oid = d.refobjid
+       GROUP BY n.nspname, tc.relname, ic.relname, ic.oid
+       ORDER BY n.nspname, tc.relname, ic.relname`,
+      [enumQualifiedNames],
+    );
+    return res.rows.map((r) => ({
+      schema: String(r.table_schema),
+      table: String(r.table_name),
+      name: String(r.index_name),
+      definition: String(r.def),
     }));
   } finally {
     await client.end();

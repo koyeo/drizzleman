@@ -9,6 +9,8 @@ interface RawJournalEntry {
   when: number;
   tag: string;
   breakpoints?: boolean;
+  // drizzleman-only — see types.ts JournalEntry.manual
+  manual?: boolean;
 }
 
 interface RawJournal {
@@ -106,6 +108,13 @@ export function readJournal(out: string): JournalEntry[] {
       const sqlPath = path.resolve(process.cwd(), out, `${e.tag}.sql`);
       const sql = readFileSync(sqlPath, 'utf8');
       const hash = createHash('sha256').update(sql).digest('hex');
-      return { idx: e.idx, tag: e.tag, when: e.when, sqlPath, hash };
+      return {
+        idx: e.idx,
+        tag: e.tag,
+        when: e.when,
+        sqlPath,
+        hash,
+        ...(e.manual ? { manual: true as const } : {}),
+      };
     });
 }

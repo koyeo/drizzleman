@@ -59,6 +59,14 @@ export async function assertSchemaDbEmpty(_creds: DbCredentials): Promise<void> 
   throw new Error('assertSchemaDbEmpty is not implemented for sqlite yet; only postgresql is supported.');
 }
 
+export async function appendAppliedHash(
+  _creds: DbCredentials,
+  _table: MigrationsTableRef,
+  _entry: { hash: string; createdAt: number },
+): Promise<{ inserted: boolean }> {
+  throw new Error('appendAppliedHash is not implemented for sqlite; rebase / manual journal entries are postgres-only.');
+}
+
 export async function resetAppliedToRebase(
   creds: DbCredentials,
   table: MigrationsTableRef,

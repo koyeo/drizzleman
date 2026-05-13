@@ -33,6 +33,12 @@ export interface JournalEntry {
   when: number;
   sqlPath: string;
   hash: string;
+  // `manual: true` (drizzleman-only journal field, ignored by drizzle-kit) marks
+  // entries whose SQL must NEVER be auto-executed against target DB — only the
+  // hash gets registered into the migrations table after the user manually
+  // runs the SQL elsewhere (e.g. `psql target -f 0001_diff.sql`). See
+  // drizzleman/CLAUDE.md G2 and SkAI/CLAUDE.md G6.
+  manual?: boolean;
 }
 
 export interface AppliedRow {

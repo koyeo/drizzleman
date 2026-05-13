@@ -80,6 +80,46 @@ export async function assertSchemaDbEmpty(creds: DbCredentials): Promise<void> {
   }
 }
 
+export async function appendAppliedHash(
+  creds: DbCredentials,
+  table: MigrationsTableRef,
+  entry: { hash: string; createdAt: number },
+): Promise<{ inserted: boolean }> {
+  const client = await connect(creds);
+  try {
+    const schema = table.schema ?? 'drizzle';
+    const qSchema = quoteIdent(schema);
+    const qTable = quoteIdent(table.table);
+    // The table is created by `drizzleman rebase` (`resetAppliedToRebase`)
+    // earlier in the lifecycle. If it doesn't exist yet, refuse — caller
+    // would be in an inconsistent state otherwise.
+    const tableCheck = await client.query(
+      `SELECT 1 FROM information_schema.tables WHERE table_schema = $1 AND table_name = $2 LIMIT 1`,
+      [schema, table.table],
+    );
+    if ((tableCheck.rowCount ?? 0) === 0) {
+      throw new Error(
+        `migrations table ${schema}.${table.table} does not exist; run \`drizzleman rebase\` first or ` +
+          `apply prior migrations via \`drizzleman migrate\`.`,
+      );
+    }
+    const existing = await client.query(
+      `SELECT 1 FROM ${qSchema}.${qTable} WHERE hash = $1 LIMIT 1`,
+      [entry.hash],
+    );
+    if ((existing.rowCount ?? 0) > 0) {
+      return { inserted: false };
+    }
+    await client.query(
+      `INSERT INTO ${qSchema}.${qTable} (hash, created_at) VALUES ($1, $2)`,
+      [entry.hash, entry.createdAt],
+    );
+    return { inserted: true };
+  } finally {
+    await client.end();
+  }
+}
+
 export async function resetAppliedToRebase(
   creds: DbCredentials,
   table: MigrationsTableRef,

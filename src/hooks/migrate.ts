@@ -2,7 +2,7 @@ import { statSync } from 'node:fs';
 import readline from 'node:readline';
 import pc from 'picocolors';
 import { migrationsTableOf } from '../config.js';
-import { readApplied } from '../db/index.js';
+import { appendAppliedHash, readApplied } from '../db/index.js';
 import { passthrough } from '../passthrough.js';
 import { readJournal } from '../journal.js';
 import { diff } from './diff.js';
@@ -57,11 +57,34 @@ export async function runMigrate(args: string[], yes: boolean): Promise<number> 
     return 0;
   }
 
+  // Partition pending into "manual" (drizzleman-generated diff.sql etc. that
+  // MUST NOT be executed by the tool — see CLAUDE.md G2/G6) vs "auto"
+  // (regular drizzle-kit migrations to be applied by drizzle-kit migrate).
+  const pendingManual = d.pending.filter((e) => e.manual === true);
+  const pendingAuto = d.pending.filter((e) => e.manual !== true);
+
   console.log(pc.bold(`[drizzleman] Pending migrations (${d.pending.length}):`));
   for (const e of d.pending) {
     let size = '?';
     try { size = formatBytes(statSync(e.sqlPath).size); } catch { /* ignore */ }
-    console.log(`  - ${pc.cyan(String(e.idx).padStart(4, '0'))}  ${e.tag.padEnd(40)} ${pc.dim(size)}`);
+    const flag = e.manual ? pc.red(' MANUAL') : '';
+    console.log(`  - ${pc.cyan(String(e.idx).padStart(4, '0'))}  ${e.tag.padEnd(40)} ${pc.dim(size)}${flag}`);
+  }
+  if (pendingManual.length > 0) {
+    console.log('');
+    console.log(
+      pc.red(
+        `  ⚠ ${pendingManual.length} entry(ies) flagged \`manual: true\` — drizzleman will register their ` +
+          `hash into ${table.schema ? `${table.schema}.` : ''}${table.table} ONLY; it will NOT execute the SQL ` +
+          `against target.`,
+      ),
+    );
+    console.log(
+      pc.dim(
+        `  Per CLAUDE.md G2/G6: you must run those files yourself, e.g. ` +
+          `\`psql <target> -f ${pendingManual[0]!.sqlPath}\`, BEFORE registering.`,
+      ),
+    );
   }
 
   if (!yes) {
@@ -70,6 +93,36 @@ export async function runMigrate(args: string[], yes: boolean): Promise<number> 
       console.log(pc.dim('[drizzleman] aborted.'));
       return 130;
     }
+  }
+
+  // Auto entries: forward to drizzle-kit migrate (which will see ALL journal
+  // entries — including manual ones — but only the pending non-manual ones
+  // matter for drizzle-kit's logic. We register manual hashes BEFORE
+  // calling drizzle-kit so drizzle-kit treats them as already applied and
+  // doesn't try to run them.
+  for (const e of pendingManual) {
+    try {
+      const r = await appendAppliedHash(config.dialect, config.dbCredentials, table, {
+        hash: e.hash,
+        createdAt: Date.now(),
+      });
+      if (r.inserted) {
+        console.log(
+          pc.green(`  ✓ registered ${e.tag} hash (manual; SQL NOT executed by drizzleman)`),
+        );
+      } else {
+        console.log(pc.dim(`  · ${e.tag} hash already present — skipped`));
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.log(pc.red(`  ✗ failed to register ${e.tag} hash: ${msg}`));
+      return 1;
+    }
+  }
+
+  if (pendingAuto.length === 0) {
+    console.log(pc.green('[drizzleman] ✓ all pending entries were manual; nothing to forward to drizzle-kit.'));
+    return 0;
   }
 
   const code = await passthrough(args);
