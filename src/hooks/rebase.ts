@@ -1053,12 +1053,12 @@ export async function runRebase(args: string[]): Promise<number> {
     pc.dim(`  target.dump.sql: ${rel(targetDumpPath)} (${fmtBytes(dumpResult.byteCount)})`),
   );
 
-  // ---- Step D: migra <target> <schema_db> → {ts}_rebase_diff_only.sql ----
+  // ---- Step D: migra <target> <schema_db> → 0000_{ts}_rebase_diff_only.sql ----
   //
   // Naming signals intent: this file is a RECORD of the target→schema delta
   // for human review (and manual `psql target -f`). It is NOT registered in
   // _journal.json and drizzleman never executes it — see CLAUDE.md G2.
-  const diffOnlyBase = `${tsLabel}_rebase_diff_only.sql`;
+  const diffOnlyBase = `0000_${tsLabel}_rebase_diff_only.sql`;
   console.log(pc.bold(`\n[drizzleman] Step D: migra <target> <schema_db> → ${diffOnlyBase}`));
   const diffPath = path.join(previewDir, diffOnlyBase);
   const diffResult = await runMigraToFile(targetUrlNorm, schemaDbUrl, migraExcludes, diffPath);
@@ -1136,7 +1136,7 @@ export async function runRebase(args: string[]): Promise<number> {
   }
   console.log(pc.green('    ✓ target dump applied to verify DB'));
 
-  // V2: pour {ts}_rebase_diff_only.sql into verify DB → verify DB now ≈ target + diff.
+  // V2: pour 0000_{ts}_rebase_diff_only.sql into verify DB → verify DB now ≈ target + diff.
   console.log(pc.bold(`  V2 (命题 ②): apply ${diffOnlyBase} to verify DB`));
   if (diffBytes === 0) {
     console.log(pc.dim('    (diff is empty — V2 trivially holds)'));
@@ -1241,7 +1241,7 @@ export async function runRebase(args: string[]): Promise<number> {
   }
 
   // J2: promote preview — move 0000 sql + meta into the migrations dir, plus
-  // {ts}_rebase_diff_only.sql alongside them as a record-only artifact. The
+  // 0000_{ts}_rebase_diff_only.sql alongside them as a record-only artifact. The
   // diff is intentionally NOT added to _journal.json: drizzleman never runs
   // it, and there is no hash to register (the user `psql`'s it by hand and
   // the next normal `drizzle-kit generate` will roll any further drift into
