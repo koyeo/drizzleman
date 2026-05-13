@@ -27,7 +27,15 @@ import {
   deriveUrlWithDbName,
   timestampForDbName,
 } from '../db/provision.js';
-import { probeDb, type DbProbe } from '../db/probe.js';
+import {
+  listPgColumnDefaults,
+  listPgEnums,
+  listPgExtensions,
+  listStandalonePgIndexes,
+  probeDb,
+  type DbProbe,
+  type PgEnumInfo,
+} from '../db/probe.js';
 import { passthrough } from '../passthrough.js';
 import type { AppliedRow, DbCredentials, DrizzleConfig } from '../types.js';
 import { targetUrl as renderUrl } from '../url.js';
@@ -70,6 +78,7 @@ interface RebaseFlags {
   verifyDbUrl: string | null;
   adminDbUrl: string | null;
   verifyOnly: boolean;
+  checkOnly: boolean;
   allowVersionMismatch: boolean;
   rest: string[];
 }
@@ -84,12 +93,14 @@ function consumeFlags(args: string[]): RebaseFlags {
   let verifyDbUrl: string | null = null;
   let adminDbUrl: string | null = null;
   let verifyOnly = false;
+  let checkOnly = false;
   let allowVersionMismatch = false;
   const rest: string[] = [];
   for (let i = start; i < args.length; i++) {
     const a = args[i]!;
     if (a === '--yes' || a === '-y') { yes = true; continue; }
     if (a === '--verify-only') { verifyOnly = true; continue; }
+    if (a === '--check-only') { checkOnly = true; continue; }
     if (a === '--allow-version-mismatch') { allowVersionMismatch = true; continue; }
     if (a === '--name') { name = args[++i] ?? name; continue; }
     if (a.startsWith('--name=')) { name = a.slice('--name='.length); continue; }
@@ -117,6 +128,7 @@ function consumeFlags(args: string[]): RebaseFlags {
     verifyDbUrl,
     adminDbUrl,
     verifyOnly,
+    checkOnly,
     allowVersionMismatch,
     rest,
   };
@@ -243,11 +255,13 @@ function cleanupDir(dir: string): void {
 function reorderForFkSafety(sql: string): string {
   const SEP = '--> statement-breakpoint';
   const parts = sql.split(SEP);
-  type Bucket = 'pre' | 'type' | 'table' | 'index' | 'fk' | 'other';
+  type Bucket = 'pre' | 'extension' | 'type' | 'table' | 'alter-default' | 'index' | 'fk' | 'other';
   const buckets: Record<Bucket, string[]> = {
     pre: [],
+    extension: [],
     type: [],
     table: [],
+    'alter-default': [],
     index: [],
     fk: [],
     other: [],
@@ -258,9 +272,14 @@ function reorderForFkSafety(sql: string): string {
       buckets.pre.push(raw);
       continue;
     }
-    if (/^\s*CREATE\s+TYPE\s/i.test(trimmed)) buckets.type.push(raw);
+    if (/^\s*CREATE\s+EXTENSION\s/i.test(trimmed)) buckets.extension.push(raw);
+    else if (/^\s*CREATE\s+TYPE\s/i.test(trimmed)) buckets.type.push(raw);
     else if (/^\s*CREATE\s+(?:UNLOGGED\s+|TEMP\s+|TEMPORARY\s+)?TABLE\s/i.test(trimmed))
       buckets.table.push(raw);
+    else if (
+      /^\s*ALTER\s+TABLE\s+.+?\s+ALTER\s+COLUMN\s+"[^"]+"\s+(?:SET|DROP)\s+DEFAULT/is.test(trimmed)
+    )
+      buckets['alter-default'].push(raw);
     else if (/^\s*CREATE\s+(?:UNIQUE\s+)?INDEX\s/i.test(trimmed)) buckets.index.push(raw);
     else if (/^\s*ALTER\s+TABLE\s+.+?\s+ADD\s+CONSTRAINT\s+"[^"]+"\s+FOREIGN\s+KEY/is.test(trimmed))
       buckets.fk.push(raw);
@@ -268,8 +287,10 @@ function reorderForFkSafety(sql: string): string {
   }
   const ordered = [
     ...buckets.pre,
+    ...buckets.extension,
     ...buckets.type,
     ...buckets.table,
+    ...buckets['alter-default'],
     ...buckets.index,
     ...buckets.fk,
     ...buckets.other,
@@ -790,6 +811,19 @@ function buildSqlForSide(
   includeChangedChecks: boolean,
 ): string {
   const diffSet = side === 'schemaDb' ? diff.onlyInSchemaDb : diff.onlyInTarget;
+  // Indexes whose entity key (= name) appears in BOTH onlyInTarget AND
+  // onlyInSchemaDb are *same-name-different-signature* collisions: target has
+  // index "foo" with shape A, local schema has index "foo" with shape B.
+  // For the delta (schemaDb side), we need to DROP target's "foo" before
+  // CREATE-ing the new shape — otherwise apply on a verify DB that already
+  // ran 0000 fails with "relation already exists".
+  const collidingIndexKeys = new Set<string>();
+  if (side === 'schemaDb') {
+    const targetIdxSet = new Set(diff.onlyInTarget.indexes);
+    for (const k of diff.onlyInSchemaDb.indexes) {
+      if (targetIdxSet.has(k)) collidingIndexKeys.add(k);
+    }
+  }
   const wantedTables = new Set(diffSet.tables);
   const wantedIndexes = new Set(diffSet.indexes);
   const wantedFks = new Set(diffSet.foreignKeys);
@@ -806,8 +840,24 @@ function buildSqlForSide(
   for (const c of chunks) {
     if (c.kind === 'enum' && wantedEnums.has(c.key)) all.push(c);
     else if (c.kind === 'table' && wantedTables.has(c.key)) all.push(c);
-    else if (c.kind === 'index' && wantedIndexes.has(c.key)) all.push(c);
-    else if (c.kind === 'fk' && wantedFks.has(c.key)) all.push(c);
+    else if (c.kind === 'index' && wantedIndexes.has(c.key)) {
+      // For colliding indexes (same name, different shape on each side),
+      // prepend DROP INDEX IF EXISTS so 0001 applies cleanly on a verify
+      // DB that already has the old shape from 0000.
+      if (collidingIndexKeys.has(c.key)) {
+        const m = c.key.match(/^index:([^.]+)\.(.+)$/);
+        if (m) {
+          const schema = m[1]!;
+          const name = m[2]!;
+          all.push({
+            ...c,
+            sql: `DROP INDEX IF EXISTS ${qTable(schema, name)};\n--> statement-breakpoint\n${c.sql}`,
+          });
+          continue;
+        }
+      }
+      all.push(c);
+    } else if (c.kind === 'fk' && wantedFks.has(c.key)) all.push(c);
   }
 
   // Synthetic columns: only for tables present on BOTH sides (else the full
@@ -907,6 +957,404 @@ function readSnapshot(dir: string): SnapshotJson {
   return JSON.parse(readFileSync(p, 'utf8')) as SnapshotJson;
 }
 
+// drizzle-kit 0.31.x introspect emits unreliable opclass annotations on btree
+// index columns — it picks ONE opclass per index (apparently from the first
+// column's column type) and replicates it to every column in the same index.
+// Postgres then rejects the index at apply time when the opclass doesn't
+// accept a later column's type:
+//   ERROR: operator class "text_ops" does not accept data type <enum>
+//   ERROR: operator class "uuid_ops" does not accept data type <enum>
+//   etc.  [SQLSTATE 42804]
+// The DB-side index metadata is fine — each column has its proper default
+// opclass (`enum_ops` for enums, `text_ops` for text, `uuid_ops` for uuid,
+// etc.); only the introspected SQL is mis-serialized.
+//
+// Strategy: strip EVERY explicit opclass annotation from CREATE INDEX
+// column lists, letting Postgres pick each column's default opclass on
+// apply. This is safe because:
+//   1. drizzle schema DSL doesn't expose opclass control, so a target DB
+//      populated by drizzle migrations has default opclasses everywhere.
+//   2. If a hand-written migration intentionally chose a non-default
+//      opclass (e.g., `text_pattern_ops` for LIKE 'prefix%'), the verify
+//      gate's migra step will flag the resulting opclass diff explicitly —
+//      visible signal beats silently-broken 0000.
+function stripIndexOpclasses(sql: string): string {
+  // Match a CREATE INDEX statement's "USING <method> (col-list)" portion.
+  // Column lists with function expressions (nested parens) won't match this
+  // simple pattern — drizzle-kit doesn't emit explicit opclasses on
+  // expression columns anyway, so it's a non-issue.
+  const INDEX_RE =
+    /(CREATE\s+(?:UNIQUE\s+)?INDEX\s+(?:IF\s+NOT\s+EXISTS\s+)?"[^"]+"\s+ON\s+(?:"[^"]+"\.)?"[^"]+"\s+USING\s+\w+\s*\()([^)]*)(\))/gi;
+
+  return sql.replace(INDEX_RE, (_match, head, colList, tail) => {
+    const entries = (colList as string)
+      .split(',')
+      .map((e) => e.trim())
+      .filter((e) => e.length > 0);
+
+    const rewritten = entries.map((entry) => {
+      // entry shape: `"col" [opclass] [ASC|DESC] [NULLS FIRST|LAST]`.
+      // Drop the word IMMEDIATELY after the quoted column name unless it's
+      // a sort modifier.
+      const m = entry.match(/^("[^"]+")\s+([A-Za-z_][A-Za-z0-9_]*)(.*)$/);
+      if (!m) return entry;
+      const quoted = m[1]!;
+      const wordAfter = m[2]!;
+      const after = m[3]!;
+      if (/^(asc|desc|nulls)$/i.test(wordAfter)) return entry;
+      // Treat wordAfter as an opclass and drop it.
+      return `${quoted}${after}`;
+    });
+
+    return `${head}${rewritten.join(', ')}${tail}`;
+  });
+}
+
+// ---- pg_indexes supplement (workaround for drizzle-kit introspect dropping indexes) ----
+
+interface ParsedIndexDef {
+  schema: string;
+  table: string;
+  name: string;
+  isUnique: boolean;
+  method: string;
+  columns: Array<{
+    expression: string;
+    isExpression: boolean;
+    asc: boolean;
+    nulls: string;
+  }>;
+  where: string;
+}
+
+// Parse `pg_get_indexdef` output for the common shapes drizzle-kit introspect
+// is most likely to drop: simple CREATE INDEX on one or more named columns,
+// optional WHERE clause. Returns null for shapes we don't confidently
+// understand (expression indexes with nested function calls, INCLUDE clauses,
+// etc.) — those go into 0000 as raw SQL only, snapshot stays as introspect
+// left it. SQL-only supplement still keeps V1 honest; snapshot mismatch
+// surfaces as a migra diff at V2 rather than a runtime error.
+function parseSimpleCreateIndex(indexDef: string): ParsedIndexDef | null {
+  const m = indexDef.match(
+    /^CREATE\s+(UNIQUE\s+)?INDEX\s+(?:CONCURRENTLY\s+)?(?:IF\s+NOT\s+EXISTS\s+)?(?:"?([^\s".]+)"?\s+)ON\s+(?:ONLY\s+)?(?:"?([^\s".]+)"?\.)?"?([^\s".]+)"?\s+USING\s+(\w+)\s+\(([^()]+)\)\s*(?:WHERE\s+(.+))?$/i,
+  );
+  if (!m) return null;
+  const isUnique = Boolean(m[1]);
+  const name = m[2]!;
+  const schema = m[3] ?? 'public';
+  const table = m[4]!;
+  const method = m[5]!.toLowerCase();
+  const colListRaw = m[6]!;
+  const whereRaw = m[7] ?? '';
+
+  const columns: ParsedIndexDef['columns'] = [];
+  for (const rawEntry of colListRaw.split(',')) {
+    const entry = rawEntry.trim();
+    if (!entry) continue;
+    // Each entry: <col> [<opclass>] [ASC|DESC] [NULLS FIRST|LAST]
+    // Bare column names may be quoted or unquoted.
+    const e = entry.match(
+      /^"?([^\s",]+)"?(?:\s+[A-Za-z_][A-Za-z0-9_]*)?(?:\s+(ASC|DESC))?(?:\s+NULLS\s+(FIRST|LAST))?$/i,
+    );
+    if (!e) return null; // unparseable column entry → bail
+    const colName = e[1]!;
+    const sortDir = (e[2] ?? 'ASC').toUpperCase();
+    const asc = sortDir !== 'DESC';
+    const nulls = (e[3] ?? (asc ? 'LAST' : 'FIRST')).toLowerCase();
+    columns.push({ expression: colName, isExpression: false, asc, nulls });
+  }
+  if (columns.length === 0) return null;
+
+  // Strip outer parens if present on the WHERE predicate, but only one level —
+  // matches how drizzle-kit's introspect serializes them.
+  const where = whereRaw.replace(/^\s*\((.*)\)\s*$/, '$1').trim();
+
+  return { schema, table, name, isUnique, method, columns, where };
+}
+
+// Builds the SnapshotIdx entry that drizzle-kit's own snapshot format
+// expects. The `opclass` field is informational (not part of our diff
+// signature), so leaving it empty keeps the supplement minimal. Other fields
+// match the shape we observed in real introspect snapshots.
+function buildSnapshotIndexEntry(idx: ParsedIndexDef): Record<string, unknown> {
+  return {
+    name: idx.name,
+    columns: idx.columns.map((c) => ({
+      expression: c.expression,
+      asc: c.asc,
+      nulls: c.nulls,
+      opclass: '',
+      isExpression: c.isExpression,
+    })),
+    isUnique: idx.isUnique,
+    concurrently: false,
+    method: idx.method,
+    where: idx.where,
+    with: {},
+  };
+}
+
+interface IndexSupplementResult {
+  // Indexes whose SQL in 0000 was REPLACED with the pg_get_indexdef version
+  // because drizzle-kit's serialization is unreliable (drops DESC / NULLS
+  // modifiers, mangles opclasses, etc.).
+  replaced: number;
+  // Indexes APPENDED to 0000 because drizzle-kit dropped them entirely.
+  appended: number;
+  // Of the appended ones, how many also made it into the snapshot.
+  appendedToSnapshot: number;
+  // Of the appended ones, how many ended up SQL-only because parsing failed.
+  sqlOnly: number;
+}
+
+function escapeRegExp(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+async function supplementMissingIndexes(
+  previewDir: string,
+  baselineFile: string,
+  config: DrizzleConfig,
+): Promise<IndexSupplementResult> {
+  const snapshotPath = path.join(previewDir, 'meta', '0000_snapshot.json');
+  const snapshot = JSON.parse(readFileSync(snapshotPath, 'utf8')) as SnapshotJson & {
+    tables?: Record<string, SnapshotTable & { indexes?: Record<string, unknown> }>;
+  };
+
+  // What indexes does drizzle-kit introspect already know about?
+  const known = new Set<string>();
+  for (const [tableKey, tbl] of Object.entries(snapshot.tables ?? {})) {
+    const schema = tableSchema(tbl, tableKey);
+    const table = tableName(tbl, tableKey);
+    for (const idxName of Object.keys((tbl as SnapshotTable).indexes ?? {})) {
+      known.add(`${schema}.${table}.${idxName}`);
+    }
+  }
+
+  const targetIndexes = await listStandalonePgIndexes(config.dbCredentials);
+
+  const result: IndexSupplementResult = {
+    replaced: 0,
+    appended: 0,
+    appendedToSnapshot: 0,
+    sqlOnly: 0,
+  };
+
+  let body = readFileSync(baselineFile, 'utf8');
+  const toAppend: string[] = [];
+
+  for (const idx of targetIndexes) {
+    const canonical = idx.indexDef.trim().replace(/;\s*$/, '');
+    // Drizzle-kit introspect emits each CREATE INDEX as a single line ending
+    // with `;--> statement-breakpoint`. Match by exact index name and
+    // replace the entire statement (preserving the trailing breakpoint
+    // marker) with the pg_get_indexdef version — that is the only
+    // authoritative source for DESC / NULLS / partial-WHERE clauses, all of
+    // which drizzle-kit 0.31.x serializes incorrectly on enough columns to
+    // make 0000 un-applyable.
+    const replaceRe = new RegExp(
+      `^CREATE\\s+(?:UNIQUE\\s+)?INDEX\\s+(?:CONCURRENTLY\\s+)?(?:IF\\s+NOT\\s+EXISTS\\s+)?"${escapeRegExp(
+        idx.indexName,
+      )}"\\s+ON\\s+[^;\\n]+;(?:--> statement-breakpoint)?$`,
+      'gim',
+    );
+    if (replaceRe.test(body)) {
+      replaceRe.lastIndex = 0;
+      body = body.replace(replaceRe, () => `${canonical};--> statement-breakpoint`);
+      result.replaced++;
+      continue;
+    }
+
+    // Not present at all — drizzle-kit dropped this index. Append + try
+    // to supplement snapshot so Step E's diff stays consistent.
+    if (
+      !known.has(`${idx.schemaName}.${idx.tableName}.${idx.indexName}`)
+    ) {
+      toAppend.push(`${canonical};`);
+      result.appended++;
+      const parsed = parseSimpleCreateIndex(idx.indexDef);
+      if (parsed) {
+        const tableKey = `${parsed.schema}.${parsed.table}`;
+        const t = snapshot.tables?.[tableKey];
+        if (t) {
+          if (!t.indexes) t.indexes = {};
+          (t.indexes as Record<string, unknown>)[parsed.name] =
+            buildSnapshotIndexEntry(parsed);
+          result.appendedToSnapshot++;
+          continue;
+        }
+      }
+      result.sqlOnly++;
+    }
+  }
+
+  if (toAppend.length > 0) {
+    if (!body.endsWith('\n')) body += '\n';
+    body += `${toAppend.join('\n--> statement-breakpoint\n')}\n`;
+  }
+
+  writeFileSync(baselineFile, body);
+  writeFileSync(snapshotPath, JSON.stringify(snapshot, null, 2));
+
+  return result;
+}
+
+// ---- pg_enum supplement (workaround for drizzle-kit dropping enum values) ----
+
+interface EnumSupplementResult {
+  replaced: number;
+  appended: number;
+}
+
+async function supplementEnumValues(
+  previewDir: string,
+  baselineFile: string,
+  config: DrizzleConfig,
+): Promise<EnumSupplementResult> {
+  const snapshotPath = path.join(previewDir, 'meta', '0000_snapshot.json');
+  const snapshot = JSON.parse(readFileSync(snapshotPath, 'utf8')) as SnapshotJson & {
+    enums?: Record<string, { name?: string; schema?: string; values?: string[] }>;
+  };
+  const targetEnums = await listPgEnums(config.dbCredentials);
+
+  const result: EnumSupplementResult = { replaced: 0, appended: 0 };
+  let body = readFileSync(baselineFile, 'utf8');
+  const toAppend: string[] = [];
+
+  for (const e of targetEnums) {
+    const valuesSqlList = e.values
+      .map((v) => `'${v.replace(/'/g, "''")}'`)
+      .join(', ');
+    const canonical = `CREATE TYPE "${e.schema}"."${e.name}" AS ENUM(${valuesSqlList});`;
+
+    const findRe = new RegExp(
+      `CREATE\\s+TYPE\\s+(?:"${escapeRegExp(e.schema)}"\\.)?"${escapeRegExp(
+        e.name,
+      )}"\\s+AS\\s+ENUM\\s*\\([^)]*\\)\\s*;(?:--> statement-breakpoint)?`,
+      'gi',
+    );
+
+    const matched = findRe.test(body);
+    findRe.lastIndex = 0;
+
+    const snapshotKey = `${e.schema}.${e.name}`;
+    const snapEnum = snapshot.enums?.[snapshotKey];
+
+    const introspectValues = snapEnum?.values ?? null;
+    const valuesIdentical =
+      introspectValues !== null &&
+      introspectValues.length === e.values.length &&
+      introspectValues.every((v, i) => v === e.values[i]);
+
+    if (matched && !valuesIdentical) {
+      body = body.replace(findRe, `${canonical}--> statement-breakpoint`);
+      result.replaced++;
+    } else if (!matched) {
+      // Enum exists on target but missing entirely from introspect SQL.
+      toAppend.push(canonical);
+      result.appended++;
+    }
+
+    // Always keep snapshot in sync with target's true values.
+    if (snapEnum && !valuesIdentical) {
+      snapEnum.values = [...e.values];
+    } else if (!snapEnum && !matched) {
+      if (!snapshot.enums) snapshot.enums = {};
+      snapshot.enums[snapshotKey] = {
+        name: e.name,
+        schema: e.schema,
+        values: [...e.values],
+      };
+    }
+  }
+
+  if (toAppend.length > 0) {
+    if (!body.endsWith('\n')) body += '\n';
+    body += `${toAppend.join('\n--> statement-breakpoint\n')}\n`;
+  }
+
+  if (result.replaced > 0 || result.appended > 0) {
+    writeFileSync(baselineFile, body);
+    writeFileSync(snapshotPath, JSON.stringify(snapshot, null, 2));
+  }
+
+  return result;
+}
+
+// ---- pg_extension + pg_attrdef supplement ----
+
+interface ExtAndDefaultsResult {
+  extensionsAdded: number;
+  defaultsFixed: number;
+}
+
+async function supplementExtensionsAndDefaults(
+  previewDir: string,
+  baselineFile: string,
+  config: DrizzleConfig,
+): Promise<ExtAndDefaultsResult> {
+  const snapshotPath = path.join(previewDir, 'meta', '0000_snapshot.json');
+  const snapshot = JSON.parse(readFileSync(snapshotPath, 'utf8')) as SnapshotJson & {
+    tables?: Record<string, SnapshotTable & {
+      columns?: Record<string, SnapshotColumn & { default?: unknown }>;
+    }>;
+  };
+
+  let body = readFileSync(baselineFile, 'utf8');
+  const result: ExtAndDefaultsResult = { extensionsAdded: 0, defaultsFixed: 0 };
+
+  // Extensions: drizzle-kit never emits CREATE EXTENSION. Prepend one
+  // `CREATE EXTENSION IF NOT EXISTS "<name>" WITH SCHEMA "<schema>";` per
+  // installed non-builtin extension. (`reorderForFkSafety` will then move
+  // them into the `extension` bucket, before CREATE TYPE / CREATE TABLE.)
+  const extensions = await listPgExtensions(config.dbCredentials);
+  if (extensions.length > 0) {
+    const extStmts = extensions.map(
+      (e) => `CREATE EXTENSION IF NOT EXISTS "${e.name}" WITH SCHEMA "${e.schema}";`,
+    );
+    body = `${extStmts.join('\n--> statement-breakpoint\n')}\n--> statement-breakpoint\n${body}`;
+    result.extensionsAdded = extensions.length;
+  }
+
+  // Column defaults: compare each target default vs snapshot. If different,
+  // append an ALTER TABLE SET DEFAULT so it overrides any wrong default
+  // baked into CREATE TABLE. Also fix the snapshot so downstream diffs see
+  // the truth. Normalize by trimming whitespace + lowercasing — enough to
+  // dedupe trivial formatting differences without hiding real semantic
+  // changes (cast suffixes, expression rewrites).
+  const targetDefaults = await listPgColumnDefaults(config.dbCredentials);
+  const altered: string[] = [];
+  for (const d of targetDefaults) {
+    const tableKey = `${d.schema}.${d.table}`;
+    const tbl = snapshot.tables?.[tableKey];
+    if (!tbl) continue;
+    const col = tbl.columns?.[d.column] as
+      | (SnapshotColumn & { default?: unknown })
+      | undefined;
+    if (!col) continue;
+    const snapDefault = col.default;
+    const same =
+      typeof snapDefault === 'string' &&
+      snapDefault.trim().toLowerCase() === d.defaultExpr.trim().toLowerCase();
+    if (same) continue;
+    altered.push(
+      `ALTER TABLE "${d.schema}"."${d.table}" ALTER COLUMN "${d.column}" SET DEFAULT ${d.defaultExpr};`,
+    );
+    col.default = d.defaultExpr;
+    result.defaultsFixed++;
+  }
+  if (altered.length > 0) {
+    if (!body.endsWith('\n')) body += '\n';
+    body += `${altered.join('\n--> statement-breakpoint\n')}\n`;
+  }
+
+  if (result.extensionsAdded > 0 || result.defaultsFixed > 0) {
+    writeFileSync(baselineFile, body);
+    writeFileSync(snapshotPath, JSON.stringify(snapshot, null, 2));
+  }
+  return result;
+}
+
 // ---- temp-DB URL resolution (manual vs admin auto-provision) ----
 
 interface ResolvedTempDbs {
@@ -1004,6 +1452,16 @@ interface MigraResult {
   error: string | null;
 }
 
+// migra is built on SQLAlchemy, whose URL dialect registry only recognises
+// `postgresql://` — `postgres://` raises "NoSuchModuleError: Can't load
+// plugin: sqlalchemy.dialects:postgres". The pg / pg-driver layers we use
+// elsewhere accept both, so URLs flow through drizzleman in either form
+// freely. Normalize only at the migra boundary.
+function normalizeUrlForMigra(url: string): string {
+  if (/^postgres:\/\//i.test(url)) return url.replace(/^postgres:\/\//i, 'postgresql://');
+  return url;
+}
+
 function runMigra(
   fromUrl: string,
   toUrl: string,
@@ -1011,8 +1469,9 @@ function runMigra(
 ): Promise<MigraResult> {
   return new Promise((resolve) => {
     const args = ['--unsafe'];
-    for (const s of excludeSchemas) args.push(`--exclude-schema=${s}`);
-    args.push(fromUrl, toUrl);
+    // migra's argparse uses underscore: --exclude_schema (not --exclude-schema).
+    for (const s of excludeSchemas) args.push(`--exclude_schema=${s}`);
+    args.push(normalizeUrlForMigra(fromUrl), normalizeUrlForMigra(toUrl));
 
     let stdout = '';
     let stderr = '';
@@ -1347,14 +1806,18 @@ export async function runRebase(args: string[]): Promise<number> {
   // For migra exclusion. Defaults to "drizzle" on postgres via migrationsTableOf.
   const migrationsSchema = table.schema ?? 'drizzle';
 
-  const previewName = `${PREVIEW_PREFIX}${ts}`;
+  // All artifacts (fs dirs, backup tables, tmpgen dir, auto-provisioned DB
+  // names) share the same human-readable timestamp YYYYMMDD_HHmmss derived
+  // from `ts = Date.now()`, so the matching pairs are obvious on disk.
+  const tsLabel = timestampForDbName(ts);
+  const previewName = `${PREVIEW_PREFIX}${tsLabel}`;
   const previewDir = path.join(outDir, previewName);
-  const tmpDir = path.join(outDir, `${SCHEMADB_INTRO_PREFIX}${ts}`);
-  const verifyMigDir = path.join(outDir, `${VERIFY_MIG_PREFIX}${ts}`);
-  const verifyIntroDir = path.join(outDir, `${VERIFYDB_INTRO_PREFIX}${ts}`);
-  const bakSlug = `rebase-bak-${ts}`;
+  const tmpDir = path.join(outDir, `${SCHEMADB_INTRO_PREFIX}${tsLabel}`);
+  const verifyMigDir = path.join(outDir, `${VERIFY_MIG_PREFIX}${tsLabel}`);
+  const verifyIntroDir = path.join(outDir, `${VERIFYDB_INTRO_PREFIX}${tsLabel}`);
+  const bakSlug = `rebase-bak-${tsLabel}`;
   const bakDir = path.join(outDir, `.${bakSlug}`);
-  const refSlug = `rebase-ref-${ts}`;
+  const refSlug = `rebase-ref-${tsLabel}`;
   const refDir = path.join(outDir, `.${refSlug}`);
   const bakTableLabel = `${table.schema ? `${table.schema}.` : ''}${bakSlug}`;
 
@@ -1397,6 +1860,129 @@ export async function runRebase(args: string[]): Promise<number> {
     console.log(`  DB rows in ${tableLabel}            : ${pc.yellow('(read failed)')} ${pc.dim(appliedError)}`);
   } else {
     console.log(`  DB rows in ${tableLabel}            : ${pc.cyan(String(applied.length))}`);
+  }
+
+  // ---- Step B: assert schema DB is empty ----
+  // Runs BEFORE Step A so --check-only can exit without touching target
+  // (Step A introspects target into previewDir; Step B/Bv are pure read checks
+  // against the two temp DBs).
+  console.log(pc.bold(`\n[drizzleman] Step B: assert schema DB is empty`));
+  try {
+    await assertSchemaDbEmpty(config.dialect, { url: schemaDbUrl });
+    console.log(pc.green('  ✓ schema DB has no user-schema tables'));
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.log(pc.red(`  ✗ ${msg}`));
+    printDbReminders(schemaDbUrl, verifyDbUrl, provisioned);
+    return 1;
+  }
+  // Same check for verify DB — even an admin-mode freshly-created DB should be empty,
+  // but in manual mode the user might point us at a DB with leftover state.
+  try {
+    await assertSchemaDbEmpty(config.dialect, { url: verifyDbUrl });
+    console.log(pc.green('  ✓ verify DB has no user-schema tables'));
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.log(pc.red(`  ✗ verify DB: ${msg}`));
+    printDbReminders(schemaDbUrl, verifyDbUrl, provisioned);
+    return 1;
+  }
+
+  // ---- Step Bv: probe engines & versions of target / schema / verify DBs ----
+  // Same engine + same major version is mandatory: a verify pass on PG 16 does
+  // not vouch for PG 13 target behaviour, and a stock-postgres verify pass
+  // does not vouch for CockroachDB / Yugabyte / etc. (these claim postgres
+  // wire-compat but diverge on DDL semantics).
+  console.log(pc.bold('\n[drizzleman] Step Bv: probe DB engines & versions'));
+  const probeResults = await Promise.allSettled([
+    probeDb(config.dialect, config.dbCredentials),
+    probeDb(config.dialect, { url: schemaDbUrl }),
+    probeDb(config.dialect, { url: verifyDbUrl }),
+  ]);
+  const probeLabels = ['target', 'schema', 'verify'] as const;
+  const probeOk: DbProbe[] = [];
+  let probeFailed = false;
+  for (let i = 0; i < probeResults.length; i++) {
+    const r = probeResults[i]!;
+    const label = probeLabels[i]!;
+    if (r.status === 'fulfilled') {
+      probeOk.push(r.value);
+      console.log(
+        `  ${label.padEnd(7)}: ${pc.cyan(r.value.engine.padEnd(12))} ` +
+          `${pc.cyan(r.value.releaseLabel.padEnd(10))} ` +
+          `${pc.dim(r.value.versionString)}`,
+      );
+    } else {
+      probeFailed = true;
+      const msg = r.reason instanceof Error ? r.reason.message : String(r.reason);
+      console.log(pc.red(`  ${label.padEnd(7)}: ✗ probe failed: ${msg}`));
+    }
+  }
+  if (probeFailed) {
+    printDbReminders(schemaDbUrl, verifyDbUrl, provisioned);
+    return 1;
+  }
+  const engines = new Set(probeOk.map((p) => p.engine));
+  if (engines.size > 1) {
+    const matrix = probeOk
+      .map((p, i) => `${probeLabels[i]}=${p.engine}`)
+      .join(' / ');
+    console.log(
+      pc.red(
+        `  ✗ engine mismatch: ${matrix}. All three DBs must report the same engine in version().`,
+      ),
+    );
+    console.log(
+      pc.dim(
+        `    --allow-version-mismatch only relaxes major-version checks; engine mismatch is never overridable.`,
+      ),
+    );
+    printDbReminders(schemaDbUrl, verifyDbUrl, provisioned);
+    return 1;
+  }
+  const majors = new Set(probeOk.map((p) => p.majorVersion));
+  if (majors.size > 1) {
+    const matrix = probeOk
+      .map((p, i) => `${probeLabels[i]}=${p.majorVersion}`)
+      .join(' / ');
+    if (flags.allowVersionMismatch) {
+      console.log(
+        pc.yellow(
+          `  ⚠ major version mismatch: ${matrix}. --allow-version-mismatch given → continuing, but verify may not represent target behaviour.`,
+        ),
+      );
+    } else {
+      console.log(
+        pc.red(
+          `  ✗ major version mismatch: ${matrix}. Pass --allow-version-mismatch to override.`,
+        ),
+      );
+      printDbReminders(schemaDbUrl, verifyDbUrl, provisioned);
+      return 1;
+    }
+  } else {
+    console.log(pc.green('  ✓ engines and major versions agree'));
+  }
+
+  // ---- --check-only exit: stop here, before Step A touches anything ----
+  // Preflight passed (URLs resolved, target readable, both temp DBs empty,
+  // engines & major versions agree). --check-only's contract is "validate
+  // setup, don't generate or apply" — so we exit before Step A (target
+  // introspect) which would create the preview dir.
+  if (flags.checkOnly) {
+    console.log(
+      pc.green('\n[drizzleman] ✓ --check-only: preflight checks all passed.'),
+    );
+    console.log(pc.dim('  No preview generated, no SQL written, no DB mutated.'));
+    if (provisioned.schema || provisioned.verify) {
+      console.log(
+        pc.dim(
+          '  Admin-mode auto-created two temp DBs; they remain (not auto-dropped). See reminder below.',
+        ),
+      );
+    }
+    printDbReminders(schemaDbUrl, verifyDbUrl, provisioned);
+    return 0;
   }
 
   // ---- Step A: introspect target DB ----
@@ -1454,120 +2040,69 @@ export async function runRebase(args: string[]): Promise<number> {
   {
     const raw = readFileSync(baselineFile, 'utf8');
     const stripped = uncommentIntrospectSql(raw);
-    const reordered = reorderForFkSafety(stripped);
-    if (reordered !== raw) {
-      writeFileSync(baselineFile, reordered);
+    // Strip drizzle-kit's unreliable opclass annotations on index columns —
+    // see `stripIndexOpclasses` for the introspect bug it works around.
+    const cleaned = stripIndexOpclasses(stripped);
+    if (cleaned !== raw) {
+      writeFileSync(baselineFile, cleaned);
+    }
+    // Repair enum CREATE TYPE statements against pg_enum (drizzle-kit
+    // sometimes drops enum values, leaving CHECK constraints / column
+    // defaults that reference unknown labels un-applyable on a fresh DB).
+    const enumSupp = await supplementEnumValues(previewDir, baselineFile, config);
+    if (enumSupp.replaced > 0 || enumSupp.appended > 0) {
+      console.log(
+        pc.dim(
+          `  pg_enum fixup: replaced=${enumSupp.replaced} appended=${enumSupp.appended}`,
+        ),
+      );
+    }
+    // CREATE EXTENSION supplements (drizzle-kit never emits them) +
+    // ALTER COLUMN SET DEFAULT fixups (drizzle-kit mangles some defaults
+    // like `'{}'::text[]` into `'{""}'`). Both placed via dedicated buckets
+    // in reorderForFkSafety: extensions before types, alter-default after
+    // tables.
+    const extDef = await supplementExtensionsAndDefaults(previewDir, baselineFile, config);
+    if (extDef.extensionsAdded > 0 || extDef.defaultsFixed > 0) {
+      console.log(
+        pc.dim(
+          `  pg_extension/attrdef fixup: +${extDef.extensionsAdded} extension(s), ` +
+            `${extDef.defaultsFixed} column default(s) corrected`,
+        ),
+      );
+    }
+    // Repair / supplement indexes via pg_indexes + pg_get_indexdef (drizzle-kit
+    // 0.31.x mis-serializes DESC / NULLS modifiers, mangles opclasses, and
+    // sometimes drops standalone unique indexes entirely). We do this BEFORE
+    // FK-safe reorder so inserted CREATE INDEX statements get placed before
+    // any ALTER ADD FK that depends on them.
+    const supp = await supplementMissingIndexes(previewDir, baselineFile, config);
+    if (supp.replaced > 0 || supp.appended > 0) {
+      console.log(
+        pc.dim(
+          `  pg_indexes fixup: replaced=${supp.replaced} appended=${supp.appended} ` +
+            `(snapshot-supplemented=${supp.appendedToSnapshot}, sql-only=${supp.sqlOnly})`,
+        ),
+      );
+    }
+    // Now reorder FK-safe (CREATE INDEX before ALTER ADD FK). Reading the
+    // file again because both the cleanup and supplement may have written to it.
+    const current = readFileSync(baselineFile, 'utf8');
+    const reordered = reorderForFkSafety(current);
+    if (reordered !== current) writeFileSync(baselineFile, reordered);
+
+    const finalContent = readFileSync(baselineFile, 'utf8');
+    if (finalContent !== raw) {
       const notes: string[] = [];
       if (stripped !== raw) notes.push('unwrapped /* ... */');
-      if (reordered !== stripped) notes.push('reordered CREATE INDEX before ALTER ADD FK');
-      console.log(pc.dim(`  rewrote 0000 (${notes.join(', ')})`));
+      if (cleaned !== stripped) notes.push('stripped index opclass annotations');
+      if (supp.replaced > 0) notes.push(`replaced ${supp.replaced} index def(s) via pg_get_indexdef`);
+      if (supp.appended > 0) notes.push(`+${supp.appended} missing index(es)`);
+      if (reordered !== current) notes.push('reordered CREATE INDEX before ALTER ADD FK');
+      if (notes.length > 0) console.log(pc.dim(`  rewrote 0000 (${notes.join(', ')})`));
     }
   }
   const rebaseHash = hashFile(baselineFile);
-
-  // ---- Step B: assert schema DB is empty ----
-  console.log(pc.bold(`\n[drizzleman] Step B: assert schema DB is empty`));
-  try {
-    await assertSchemaDbEmpty(config.dialect, { url: schemaDbUrl });
-    console.log(pc.green('  ✓ schema DB has no user-schema tables'));
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    console.log(pc.red(`  ✗ ${msg}`));
-    cleanupDir(previewDir);
-    printDbReminders(schemaDbUrl, verifyDbUrl, provisioned);
-    return 1;
-  }
-  // Same check for verify DB — even an admin-mode freshly-created DB should be empty,
-  // but in manual mode the user might point us at a DB with leftover state.
-  try {
-    await assertSchemaDbEmpty(config.dialect, { url: verifyDbUrl });
-    console.log(pc.green('  ✓ verify DB has no user-schema tables'));
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    console.log(pc.red(`  ✗ verify DB: ${msg}`));
-    cleanupDir(previewDir);
-    printDbReminders(schemaDbUrl, verifyDbUrl, provisioned);
-    return 1;
-  }
-
-  // ---- Step Bv: probe engines & versions of target / schema / verify DBs ----
-  // Same engine + same major version is mandatory: a verify pass on PG 16 does
-  // not vouch for PG 13 target behaviour, and a stock-postgres verify pass
-  // does not vouch for CockroachDB / Yugabyte / etc. (these claim postgres
-  // wire-compat but diverge on DDL semantics).
-  console.log(pc.bold('\n[drizzleman] Step Bv: probe DB engines & versions'));
-  const probeResults = await Promise.allSettled([
-    probeDb(config.dialect, config.dbCredentials),
-    probeDb(config.dialect, { url: schemaDbUrl }),
-    probeDb(config.dialect, { url: verifyDbUrl }),
-  ]);
-  const probeLabels = ['target', 'schema', 'verify'] as const;
-  const probeOk: DbProbe[] = [];
-  let probeFailed = false;
-  for (let i = 0; i < probeResults.length; i++) {
-    const r = probeResults[i]!;
-    const label = probeLabels[i]!;
-    if (r.status === 'fulfilled') {
-      probeOk.push(r.value);
-      console.log(
-        `  ${label.padEnd(7)}: ${pc.cyan(r.value.engine.padEnd(12))} ` +
-          `${pc.cyan(`${r.value.majorVersion}.${r.value.minorVersion}.${r.value.patchVersion}`.padEnd(10))} ` +
-          `${pc.dim(r.value.versionString)}`,
-      );
-    } else {
-      probeFailed = true;
-      const msg = r.reason instanceof Error ? r.reason.message : String(r.reason);
-      console.log(pc.red(`  ${label.padEnd(7)}: ✗ probe failed: ${msg}`));
-    }
-  }
-  if (probeFailed) {
-    cleanupDir(previewDir);
-    printDbReminders(schemaDbUrl, verifyDbUrl, provisioned);
-    return 1;
-  }
-  const engines = new Set(probeOk.map((p) => p.engine));
-  if (engines.size > 1) {
-    const matrix = probeOk
-      .map((p, i) => `${probeLabels[i]}=${p.engine}`)
-      .join(' / ');
-    console.log(
-      pc.red(
-        `  ✗ engine mismatch: ${matrix}. All three DBs must report the same engine in version().`,
-      ),
-    );
-    console.log(
-      pc.dim(
-        `    --allow-version-mismatch only relaxes major-version checks; engine mismatch is never overridable.`,
-      ),
-    );
-    cleanupDir(previewDir);
-    printDbReminders(schemaDbUrl, verifyDbUrl, provisioned);
-    return 1;
-  }
-  const majors = new Set(probeOk.map((p) => p.majorVersion));
-  if (majors.size > 1) {
-    const matrix = probeOk
-      .map((p, i) => `${probeLabels[i]}=${p.majorVersion}`)
-      .join(' / ');
-    if (flags.allowVersionMismatch) {
-      console.log(
-        pc.yellow(
-          `  ⚠ major version mismatch: ${matrix}. --allow-version-mismatch given → continuing, but verify may not represent target behaviour.`,
-        ),
-      );
-    } else {
-      console.log(
-        pc.red(
-          `  ✗ major version mismatch: ${matrix}. Pass --allow-version-mismatch to override.`,
-        ),
-      );
-      cleanupDir(previewDir);
-      printDbReminders(schemaDbUrl, verifyDbUrl, provisioned);
-      return 1;
-    }
-  } else {
-    console.log(pc.green('  ✓ engines and major versions agree'));
-  }
 
   // ---- Step C: materialize local schema to schema DB via generate + migrate ----
   // We deliberately avoid `drizzle-kit push` — in 0.31.5 it silently drops indexes
@@ -1575,7 +2110,7 @@ export async function runRebase(args: string[]): Promise<number> {
   // DB snapshot that under-reports local schema. `generate` produces canonical SQL
   // covering everything; `migrate` then applies it via drizzle-kit's own runner.
   console.log(pc.bold(`\n[drizzleman] Step C: drizzle-kit generate → migrate (schema DB)`));
-  const tmpgenDir = path.join('/tmp', `drizzleman-rebase-tmpgen-${ts}`);
+  const tmpgenDir = path.join('/tmp', `drizzleman-rebase-tmpgen-${tsLabel}`);
   if (existsSync(tmpgenDir)) {
     console.log(pc.red(`[drizzleman] ✗ tmpgen dir already exists: ${tmpgenDir}; remove it and retry.`));
     cleanupDir(previewDir);
@@ -1701,6 +2236,18 @@ export async function runRebase(args: string[]): Promise<number> {
     return 1;
   }
   const schemaDbSqlPath = path.join(tmpDir, `${schemaDbJournal[0]!.tag}.sql`);
+  // Apply the same opclass-strip rewrite to the schema-DB introspected SQL
+  // before chunking — otherwise statements lifted out of these chunks (e.g.,
+  // CREATE INDEX going into 0001_delta.sql) carry the same buggy opclass
+  // annotations and fail at apply time on non-text columns.
+  {
+    const raw = readFileSync(schemaDbSqlPath, 'utf8');
+    const cleaned = stripIndexOpclasses(raw);
+    if (cleaned !== raw) {
+      writeFileSync(schemaDbSqlPath, cleaned);
+      console.log(pc.dim('  rewrote schema-DB introspect SQL (stripped index opclass annotations)'));
+    }
+  }
   const targetChunks = chunkSql(readFileSync(targetSqlPath, 'utf8'));
   const schemaDbChunks = chunkSql(readFileSync(schemaDbSqlPath, 'utf8'));
 

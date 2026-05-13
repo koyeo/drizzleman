@@ -18,14 +18,19 @@ export async function runInfo(args: string[]): Promise<number> {
     return 1;
   }
 
+  // Show "major=X, patch=Y" without a misleading minor for postgres 10+
+  // (server_version_num is MAJOR*10000+PATCH there, so minor is always 0 and
+  // not part of the canonical release label like "18.2").
+  const isPg10Plus = probe.engine === 'PostgreSQL' && probe.majorVersion >= 10;
+  const numericAnnotation = isPg10Plus
+    ? `major=${probe.majorVersion}, patch=${probe.patchVersion}`
+    : `major=${probe.majorVersion}, minor=${probe.minorVersion}, patch=${probe.patchVersion}`;
+
   console.log(pc.bold('[drizzleman] target DB info:'));
   console.log(`  URL          : ${pc.cyan(renderUrl(config))}`);
   console.log(`  dialect      : ${config.dialect}`);
   console.log(`  engine       : ${pc.cyan(probe.engine)}`);
   console.log(`  version      : ${probe.versionString}`);
-  console.log(
-    `  parsed       : ${pc.cyan(`${probe.majorVersion}.${probe.minorVersion}.${probe.patchVersion}`)}` +
-      `  ${pc.dim(`(major=${probe.majorVersion}, minor=${probe.minorVersion}, patch=${probe.patchVersion})`)}`,
-  );
+  console.log(`  parsed       : ${pc.cyan(probe.releaseLabel)}  ${pc.dim(`(${numericAnnotation})`)}`);
   return 0;
 }
